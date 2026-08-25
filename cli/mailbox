@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# mailbox -- thin, KEYLESS CLI for the nostr-mailbox container.
+#
+# Holds no key and does no crypto: it just curls the container's local HTTP API (which
+# holds the key and signs). Config from env:
+#   MAILBOX_API        default http://mailbox-<avatar>:8787   (avatar docker network)
+#   MAILBOX_API_TOKEN  bearer token (same one injected into the container)
+#
+# Usage:
+#   mailbox send <to> --subject <s> [--reply <id>] <body|->
+#   mailbox list [--status unread,postponed]
+#   mailbox read <id>
+#   mailbox reply <id> <body|->
+#   mailbox mark <id> <read|considered|postponed|done> [--note <text>]
+#   mailbox contacts
+#   mailbox health
+set -euo pipefail
+
+API="${MAILBOX_API:-http://mailbox-${MAILBOX_AVATAR:-undergryd-software-engineer}:8787}"
+TOKEN="${MAILBOX_API_TOKEN:-}"
+[ -n "$TOKEN" ] || { echo "mailbox: MAILBOX_API_TOKEN not set" >&2; exit 2; }
+
+req() { # method path [json-body]
+  local m="$1" p="$2" body="${3:-}"
+  if [ -n "$body" ]; then
+    curl -fsS -X "$m" "$API$p" -H "Authorization: Bearer $TOKEN" \
+      -H 'Content-Type: application/json' -d "$body"
+  else
+    curl -fsS -X "$m" "$API$p" -H "Authorization: Bearer $TOKEN"
+  fi
+}
+
+# json-escape stdin
+jesc() { python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'; }
+
+read_body() { # <arg>  ("-" => stdin)
+  if [ "${1:-}" = "-" ]; then cat; else printf '%s' "$1"; fi
+}
+
+cmd="${1:-}"; shift || true
+case "$cmd" in
+  send)
+    to="$1"; shift
+    subject=""; reply=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --subject) subject="$2"; shift 2;;
+      --reply)   reply="$2"; shift 2;;
+      *) break;;
+    esac; done
+    body="$(read_body "${1:-}" )"
+    payload="$(printf '{"to":%s,"subject":%s,"body":%s%s}' \
+      "$(printf '%s' "$to" | jesc)" \
+      "$(printf '%s' "$subject" | jesc)" \
+      "$(printf '%s' "$body" | jesc)" \
+      "$( [ -n "$reply" ] && printf ',"reply_to":%s' "$(printf '%s' "$reply" | jesc)" || true )")"
+    req POST /send "$payload"; echo
+    ;;
+  reply)
+    id="$1"; shift
+    body="$(read_body "${1:-}")"
+    # reply reuses send with reply_to; subject prefixed Re:
+    orig="$(req GET "/messages/$id" || true)"
+    subj="$(printf '%s' "$orig" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("row",{}).get("subject",""))' 2>/dev/null || true)"
+    peer="$(printf '%s' "$orig" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("row",{}).get("peer",""))' 2>/dev/null || true)"
+    payload="$(printf '{"to":%s,"subject":%s,"body":%s,"reply_to":%s}' \
+      "$(printf '%s' "$peer" | jesc)" \
+      "$(printf 'Re: %s' "$subj" | jesc)" \
+      "$(printf '%s' "$body" | jesc)" \
+      "$(printf '%s' "$id" | jesc)")"
+    req POST /send "$payload"; echo
+    ;;
+  list)
+    q=""
+    [ "${1:-}" = "--status" ] && q="?status=$2"
+    req GET "/messages$q"
+    ;;
+  read)   req GET "/messages/$1";;
+  mark)
+    id="$1"; status="$2"; shift 2; note=""
+    [ "${1:-}" = "--note" ] && note="$2"
+    req POST "/messages/$id/status" "$(printf '{"status":%s,"note":%s}' \
+      "$(printf '%s' "$status" | jesc)" "$(printf '%s' "$note" | jesc)")"; echo
+    ;;
+  contacts) req GET /contacts;;
+  health)   req GET /health;;
+  *) echo "usage: mailbox {send|reply|list|read|mark|contacts|health} ..." >&2; exit 2;;
+esac
