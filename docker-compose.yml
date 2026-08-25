@@ -1,0 +1,59 @@
+# nostr-mailbox for undergryd-software-engineer -- the per-avatar mailbox.
+#
+# On-demand: up with the avatar. Holds the avatar's Nostr key, signs + publishes
+# messages, fetches + archives incoming mail into inbox/, serves a token-guarded local
+# HTTP API for the `mailbox` CLI skill. Only the shared relay is always-on.
+#
+# DUAL-HOMED: joined to the avatar's own network (so the sandbox CLI reaches :8787) AND
+# the shared `nostr-mailbox-net` (so it reaches the relay). The relay + shared network are
+# provisioned by avatar-builder (see relay/); this compose treats the network as external.
+#
+# The agent has no docker/Go: build + run is host-side. The maintainer mints the key and
+# stores it in `pass`; the harness injects NOSTR_MAILBOX_NSEC + MAILBOX_API_TOKEN.
+services:
+  mailbox:
+    image: ${MAILBOX_IMAGE:-undergryd/nostr-mailbox:go1.22}
+    build:
+      context: ${AVATAR_ROOT}/tools/nostr-mailbox
+    pull_policy: build
+    container_name: mailbox-${AGENT_NETWORK:-undergryd-software-engineer}
+    init: true
+    environment:
+      MAILBOX_AVATAR: ${AGENT_NETWORK:-undergryd-software-engineer}
+      # Private key, from pass via harness/config SANDBOX_SECRETS. Never logged. Fails
+      # loud at start if unset (config.go) rather than binding a keyless mailbox.
+      NOSTR_MAILBOX_NSEC: ${NOSTR_MAILBOX_NSEC:?export NOSTR_MAILBOX_NSEC (pass; maintainer-minted)}
+      # Bearer token shared with the CLI (also injected into the sandbox).
+      MAILBOX_API_TOKEN: ${MAILBOX_API_TOKEN:?export MAILBOX_API_TOKEN}
+      # Relay list (v1: the one shared hub on nostr-mailbox-net).
+      NOSTR_MAILBOX_RELAYS: ${NOSTR_MAILBOX_RELAYS:-ws://nostr-relay:8080}
+      MAILBOX_REGISTRY: /config/registry.json
+      MAILBOX_STATE_DIR: /state
+      MAILBOX_INBOX: /mail/inbox
+      MAILBOX_OUTBOX: /mail/outbox
+      MAILBOX_API_ADDR: ":8787"
+    volumes:
+      # Archives land in the avatar's real inbox/outbox (host paths from harness/config),
+      # so the git-tracked record + boot "read inbox" habit keep working.
+      - ${MAILBOX_INBOX_HOST_PATH:?export MAILBOX_INBOX_HOST_PATH (the avatar's inbox/)}:/mail/inbox
+      - ${MAILBOX_OUTBOX_HOST_PATH:?export MAILBOX_OUTBOX_HOST_PATH (the avatar's outbox/)}:/mail/outbox
+      # Per-avatar mutable state: index.json + cursor.
+      - mailbox-state:/state
+      # Shared, read-only contacts/identity map (avatar-builder-provisioned).
+      - ${MAILBOX_REGISTRY_HOST_PATH:?export MAILBOX_REGISTRY_HOST_PATH (shared registry.json)}:/config/registry.json:ro
+    restart: unless-stopped
+    networks:
+      - agent
+      - relay
+
+volumes:
+  mailbox-state:
+    name: ${AGENT_NETWORK:-undergryd-software-engineer}-mailbox-state
+
+networks:
+  agent:
+    name: ${AGENT_NETWORK:-undergryd-software-engineer}
+  # Provisioned by avatar-builder (relay/docker-compose.yml); shared across avatars.
+  relay:
+    external: true
+    name: nostr-mailbox-net

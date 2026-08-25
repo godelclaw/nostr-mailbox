@@ -1,93 +1,94 @@
 # nostr-mailbox
 
+Inter-avatar messaging over a Nostr relay. Replaces hand-copying markdown between
+avatars' `outbox/`→`inbox/`. Design: [`design/nostr-mailbox.md`](docs/design.md).
 
+**Two layers, strict:** Nostr = opaque byte transport; the message body is whatever the
+sender put there (v1: markdown; later: nuActor bytes). Nostr never inspects/secures the
+payload — message security is nuActor's job.
 
-## Getting started
+## Parts
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+This is the **per-avatar tool** (one per avatar). The shared relay + the shared
+`registry.json` are a **separate component**, `nostr-relay` (one per fleet). The mailbox is
+a *client* of that relay — it connects to it, it does not contain it.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+| part | what | where |
+|---|---|---|
+| `mailbox-<avatar>` container (this dir, Go) | holds the key, signs, fetches, archives, serves the local API | this component; run per avatar |
+| `cli/mailbox` + `skills/mailbox` | thin, keyless CLI skill the agent uses (`curl` + token) | this component; installed per avatar |
+| `.mailbox/index.json` | per-avatar message-state index (local, mutable) | the container |
+| `nostr-rs-relay` + shared `registry.json` | always-on store-and-forward buffer + contacts map | **`nostr-relay` component** (separate repo) |
 
-## Add your files
+The container is **dual-homed**: the avatar's docker network (so the CLI reaches
+`:8787`) and the shared `nostr-mailbox-net` (so it reaches the `nostr-relay`). It is
+**on-demand** — up with the avatar; on start it fetches everything missed since its
+cursor. Only the relay is always-on.
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+## Wire spec (frozen — P1)
 
-```
-cd existing_repo
-git remote add origin https://gitlab.com/nunet/applications/tools/nostr-mailbox.git
-git branch -M main
-git push -uf origin main
-```
+### Message event — `kind 3838`
+NIP-01 event. `kind` = payload-format version.
+- `pubkey` sender (hex) · `content` body bytes (v1 markdown) · `sig` schnorr (transport
+  plumbing only) · `created_at` unix s.
+- tags: `["p", <recipient hex>]` (the only routing datum), `["subject", …]`,
+  `["from_name", …]`, `["to_name", …]`, `["e", <parent>, "", "reply"]` (NIP-10, on reply).
 
-## Integrate with your tools
+### Delivery receipt — `kind 3839`
+Emitted on archive. `content` empty; tags `["e", <original id>]`, `["p", <sender hex>]`.
 
-* [Set up project integrations](https://gitlab.com/nunet/applications/tools/nostr-mailbox/-/settings/integrations)
+### Archive file (`inbox/` on receive, `outbox/` on send)
+`YYYY-MM-DD-from-<sender>-<subject-slug>.md` / `…-to-<recipient>-…` (collision → append a
+short event-id). YAML frontmatter (`event_id, kind, from, from_name, from_did, to,
+to_name, subject, reply_to, created_at, received_at, sig`) then the body.
 
-## Collaborate with your team
+### `registry.json` (shared, public) — owned by the `nostr-relay` component
+`name → { npub, pubkey_hex, "did:key", dids[], display }` (format: the `nostr-relay` component (`registry.example.json`)).
+Multiaddressing: one identity, many bound addresses; the mailbox routes/subscribes on
+`pubkey_hex`. Read-only-mounted into this container.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+### `.mailbox/index.json` (per-avatar, mutable)
+`event_id → { status, dir, from|to, subject, created_at, received_at, file, note,
+updated_at }`. `status ∈ {unread, read, considered, postponed, done, sent}`.
 
-## Test and Deploy
+## Local HTTP API (avatar net; `Authorization: Bearer $MAILBOX_API_TOKEN`)
 
-Use the built-in continuous integration in GitLab.
+| method | path | body / query | returns |
+|---|---|---|---|
+| POST | `/send` | `{to, subject, body, reply_to?}` | `{event_id}` |
+| GET | `/messages` | `?status=unread,postponed` | index rows |
+| GET | `/messages/{id}` | — | row + body |
+| POST | `/messages/{id}/status` | `{status, note?}` | ok |
+| GET | `/contacts` | — | registry |
+| GET | `/health` | — | `{ok, relay_connected, cursor}` |
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+## Config (env, injected by the harness)
 
-***
+| var | meaning |
+|---|---|
+| `MAILBOX_AVATAR` | this avatar's registry name |
+| `NOSTR_MAILBOX_NSEC` | this avatar's private key (from `pass`; never logged) |
+| `MAILBOX_API_TOKEN` | bearer token shared with the CLI |
+| `NOSTR_MAILBOX_RELAYS` | comma-separated relay URLs (v1: the one hub) |
+| `MAILBOX_REGISTRY` | path to `registry.json` (ro) |
+| `MAILBOX_STATE_DIR` | path to `.mailbox/` (rw) |
+| `MAILBOX_INBOX` / `MAILBOX_OUTBOX` | archive dirs (rw) |
+| `MAILBOX_API_ADDR` | listen addr (default `:8787`) |
 
-# Editing this README
+## CLI (`cli/mailbox`, keyless)
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+`mailbox send <to> --subject <s> [--reply <id>] <body|->` · `mailbox list [--status …]` ·
+`mailbox read <id>` · `mailbox reply <id> <body>` ·
+`mailbox mark <id> <read|considered|postponed|done> [--note …]` · `mailbox contacts`.
+Reads `MAILBOX_API` (default `http://mailbox-<avatar>:8787`) and `MAILBOX_API_TOKEN`.
 
-## Suggestions for a good README
+## Build / run
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+`docker-compose.yml` builds the Go container (pinned tag, `pull_policy: build`). The
+shared relay + network are the separate **`nostr-relay`** component (provisioned by
+avatar-builder). **Agents never mint keys** — the operator mints per avatar and stores the
+`nsec` in `pass`; see the `nostr-relay` component `MAINTAINER.md`.
 
-## Name
-Choose a self-explaining name for your project.
-
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
-
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
-
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
-
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
-
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
-
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
-
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
-
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
-
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
-
-## License
-For open source projects, say how it is licensed.
-
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+> Status: v1, pending host-side `go build` + the P4 acceptance run (§12 of the design).
+> The Go here is authored + reviewed in a sandbox without Go/docker; compile shakes out
+> any `go-nostr` API drift.
