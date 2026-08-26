@@ -42,10 +42,13 @@ Emitted on archive. `content` empty; tags `["e", <original id>]`, `["p", <sender
 short event-id). YAML frontmatter (`event_id, kind, from, from_name, from_did, to,
 to_name, subject, reply_to, created_at, received_at, sig`) then the body.
 
-### `registry.json` (shared, public) — owned by the `nostr-relay` component
+### `registry.json` (the address book — one copy per avatar)
 `name → { npub, pubkey_hex, "did:key", dids[], display }` (format: the `nostr-relay` component (`registry.example.json`)).
 Multiaddressing: one identity, many bound addresses; the mailbox routes/subscribes on
-`pubkey_hex`. Read-only-mounted into this container.
+`pubkey_hex`. Each avatar holds **its own writable copy**, materialized with the component
+and generated from `pass` by `scripts/build-registry` — there is no shared original to
+mount, because avatars will not always share a filesystem. The file carries no authority:
+a message is trusted because its signature verifies, not because of what this map says.
 
 ### `.mailbox/index.json` (per-avatar, mutable)
 `event_id → { status, dir, from|to, subject, created_at, received_at, file, note,
