@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# Mint a Nostr keypair per avatar and store it in pass. MAINTAINER-run, host-side:
+# agents never touch private keys (docs/design.md R2-Q5).
+#
+#   scripts/mint-avatar-keys <avatar> [avatar...]
+#
+# Per avatar it writes two pass entries -- <prefix>/<avatar>/nostr-nsec (the
+# identity, 64-char hex; the container accepts hex or nsec1) and
+# .../mailbox-api-token (the CLI<->container bearer) -- and prints the PUBLIC
+# parts for registry.json and the relay's pubkey_whitelist. The private key goes
+# container stdout -> pass stdin and is never printed.
+#
+# Needs docker and pass on the host; no Go toolchain.
+set -euo pipefail
+
+PASS_PREFIX="${PASS_PREFIX:-nunet/avatars}"
+GO_IMAGE="${GO_IMAGE:-golang:1.22-alpine}"
+REPO="$(cd "$(dirname "$0")/.." && pwd)"
+
+[ $# -gt 0 ] || { echo "usage: $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
+
+for avatar in "$@"; do
+    out=$(docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+        -v "$REPO":/src -w /src "$GO_IMAGE" go run ./scripts/keygen)
+
+    printf '%s\n' "$out" | awk '/^sk_hex/{print $3}' \
+        | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-nsec" >/dev/null
+    pass generate -n -f "$PASS_PREFIX/$avatar/mailbox-api-token" 48 >/dev/null
+
+    printf '%-34s pubkey_hex=%s  npub=%s\n' "$avatar" \
+        "$(printf '%s\n' "$out" | awk '/^pubkey_hex/{print $3}')" \
+        "$(printf '%s\n' "$out" | awk '/^npub/{print $3}')"
+done

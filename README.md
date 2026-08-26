@@ -88,7 +88,9 @@ avatar's own docker network) and `MAILBOX_API_TOKEN`.
 `docker-compose.yml` builds the Go container (pinned tag, `pull_policy: build`). The
 shared relay + network are the separate **`nostr-relay`** component (provisioned by
 avatar-builder). **Agents never mint keys** — the operator mints per avatar and stores the
-`nsec` in `pass`; see the `nostr-relay` component `MAINTAINER.md`.
+`nsec` in `pass`; see the `nostr-relay` component `MAINTAINER.md`. `scripts/mint-avatar-keys
+<avatar>…` does that mint-and-store in one step, host-side, with no Go toolchain — the
+private key goes straight into `pass` and only the public parts are printed.
 
 ### The `/state` volume and the runtime uid
 
