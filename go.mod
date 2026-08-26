@@ -1,4 +1,4 @@
-module github.com/nunet/undergryd/nostr-mailbox
+module gitlab.com/nunet/applications/tools/nostr-mailbox
 
 go 1.22
 

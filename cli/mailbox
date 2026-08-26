@@ -3,7 +3,9 @@
 #
 # Holds no key and does no crypto: it just curls the container's local HTTP API (which
 # holds the key and signs). Config from env:
-#   MAILBOX_API        default http://mailbox-<avatar>:8787   (avatar docker network)
+#   MAILBOX_API        default http://mailbox:8787   (the compose service alias on the
+#                      avatar's own docker network; set it explicitly to reach a
+#                      mailbox addressed by container name instead)
 #   MAILBOX_API_TOKEN  bearer token (same one injected into the container)
 #
 # Usage:
@@ -16,7 +18,7 @@
 #   mailbox health
 set -euo pipefail
 
-API="${MAILBOX_API:-http://mailbox-${MAILBOX_AVATAR:-undergryd-software-engineer}:8787}"
+API="${MAILBOX_API:-http://mailbox:8787}"
 TOKEN="${MAILBOX_API_TOKEN:-}"
 [ -n "$TOKEN" ] || { echo "mailbox: MAILBOX_API_TOKEN not set" >&2; exit 2; }
 

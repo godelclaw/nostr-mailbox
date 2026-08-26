@@ -80,7 +80,8 @@ updated_at }`. `status ∈ {unread, read, considered, postponed, done, sent}`.
 `mailbox send <to> --subject <s> [--reply <id>] <body|->` · `mailbox list [--status …]` ·
 `mailbox read <id>` · `mailbox reply <id> <body>` ·
 `mailbox mark <id> <read|considered|postponed|done> [--note …]` · `mailbox contacts`.
-Reads `MAILBOX_API` (default `http://mailbox-<avatar>:8787`) and `MAILBOX_API_TOKEN`.
+Reads `MAILBOX_API` (default `http://mailbox:8787` — the compose service alias on the
+avatar's own docker network) and `MAILBOX_API_TOKEN`.
 
 ## Build / run
 
@@ -88,6 +89,22 @@ Reads `MAILBOX_API` (default `http://mailbox-<avatar>:8787`) and `MAILBOX_API_TO
 shared relay + network are the separate **`nostr-relay`** component (provisioned by
 avatar-builder). **Agents never mint keys** — the operator mints per avatar and stores the
 `nsec` in `pass`; see the `nostr-relay` component `MAINTAINER.md`.
+
+### The `/state` volume and the runtime uid
+
+`/state` is a **named volume**, and Docker initialises a fresh named volume from the
+image's content at that path — **ownership included**. An image that does not contain
+`/state` therefore yields a root-owned volume, and this container, which runs non-root,
+cannot write `index.json` or its cursor. A compose `user:` line does not fix that; only
+creating the directory in the image does. The same class of bug hit `bdd-runner`'s npm
+cache and `maintainer`'s `/exchange` and `/audit`.
+
+So the Dockerfile takes `MAILBOX_UID`/`MAILBOX_GID` build args (default `1000`), creates
+`/state` owned by them, and runs as them. The avatar's compose passes the harness's
+`HOST_UID`/`HOST_GID`, which also makes the `inbox/`/`outbox/` **host binds** writable —
+they are owned by the host user. **The uid is part of the image tag**
+(`go1.22-uid<uid>`), so a host with a different user builds its own image instead of
+silently reusing one whose `/state` belongs to somebody else.
 
 > Status: v1, pending host-side `go build` + the P4 acceptance run (§12 of the design).
 > The Go here is authored + reviewed in a sandbox without Go/docker; compile shakes out
