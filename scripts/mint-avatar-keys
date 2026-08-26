@@ -4,11 +4,23 @@
 #
 #   scripts/mint-avatar-keys <avatar> [avatar...]
 #
-# Per avatar it writes two pass entries -- <prefix>/<avatar>/nostr-nsec (the
-# identity, 64-char hex; the container accepts hex or nsec1) and
-# .../mailbox-api-token (the CLI<->container bearer) -- and prints the PUBLIC
-# parts for registry.json and the relay's pubkey_whitelist. The private key goes
-# container stdout -> pass stdin and is never printed.
+# Per avatar it writes four pass entries -- everything about that identity lives
+# in pass, nowhere else:
+#
+#   <prefix>/<avatar>/nostr-nsec           private key, 64-char hex (container
+#                                          accepts hex or nsec1)
+#   <prefix>/<avatar>/nostr-pubkey-hex     public key -> relay pubkey_whitelist
+#   <prefix>/<avatar>/nostr-npub           public key, bech32 -> registry.json
+#   <prefix>/<avatar>/mailbox-api-token    the CLI<->container bearer
+#
+# The public parts are echoed too, since they are what gets copied into
+# registry.json and config.toml. The private key goes container stdout -> pass
+# stdin and is never printed.
+#
+# RE-RUNNING MINTS NEW KEYS and overwrites all four entries. An avatar already
+# published in registry.json + the relay allowlist must be re-published, or it
+# will fail to start: the container asserts the injected key matches its
+# registry entry.
 #
 # Needs docker and pass on the host; no Go toolchain.
 set -euo pipefail
@@ -23,11 +35,14 @@ for avatar in "$@"; do
     out=$(docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
         -v "$REPO":/src -w /src "$GO_IMAGE" go run ./scripts/keygen)
 
+    pubkey_hex=$(printf '%s\n' "$out" | awk '/^pubkey_hex/{print $3}')
+    npub=$(printf '%s\n' "$out" | awk '/^npub/{print $3}')
+
     printf '%s\n' "$out" | awk '/^sk_hex/{print $3}' \
         | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-nsec" >/dev/null
+    printf '%s\n' "$pubkey_hex" | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-pubkey-hex" >/dev/null
+    printf '%s\n' "$npub"       | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-npub" >/dev/null
     pass generate -n -f "$PASS_PREFIX/$avatar/mailbox-api-token" 48 >/dev/null
 
-    printf '%-34s pubkey_hex=%s  npub=%s\n' "$avatar" \
-        "$(printf '%s\n' "$out" | awk '/^pubkey_hex/{print $3}')" \
-        "$(printf '%s\n' "$out" | awk '/^npub/{print $3}')"
+    printf '%-34s pubkey_hex=%s  npub=%s\n' "$avatar" "$pubkey_hex" "$npub"
 done
