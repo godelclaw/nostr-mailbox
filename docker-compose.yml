@@ -1,25 +1,52 @@
-# nostr-mailbox for undergryd-software-engineer -- the per-avatar mailbox.
+# nostr-mailbox -- the per-avatar mailbox.
+#
+# MATERIALIZATION TEMPLATE: copy to an avatar as
+# tools/nostr-mailbox/docker-compose.yml (with the Dockerfile and *.go beside it)
+# and adapt the header to the avatar. Everything avatar-specific is a variable.
 #
 # On-demand: up with the avatar. Holds the avatar's Nostr key, signs + publishes
-# messages, fetches + archives incoming mail into inbox/, serves a token-guarded local
-# HTTP API for the `mailbox` CLI skill. Only the shared relay is always-on.
+# messages, fetches + archives incoming mail into inbox/, serves a token-guarded
+# local HTTP API for the `mailbox` CLI skill. Only the shared relay is always-on.
 #
-# DUAL-HOMED: joined to the avatar's own network (so the sandbox CLI reaches :8787) AND
-# the shared `nostr-mailbox-net` (so it reaches the relay). The relay + shared network are
-# provisioned by avatar-builder (see relay/); this compose treats the network as external.
+# DUAL-HOMED: joined to the avatar's own network (so the sandbox CLI reaches
+# :8787) AND the shared `nostr-mailbox-net` (so it reaches the relay). The relay
+# and that network come from the SEPARATE `tools/nostr-relay` component -- one per
+# fleet, brought up independently of any avatar -- so this compose treats the
+# network as external.
 #
-# The agent has no docker/Go: build + run is host-side. The maintainer mints the key and
-# stores it in `pass`; the harness injects NOSTR_MAILBOX_NSEC + MAILBOX_API_TOKEN.
+# The agent has no docker/Go: build + run is host-side. The maintainer mints the
+# key and stores it in `pass`; the harness injects NOSTR_MAILBOX_NSEC +
+# MAILBOX_API_TOKEN.
 services:
   mailbox:
-    image: ${MAILBOX_IMAGE:-undergryd/nostr-mailbox:go1.22}
+    # Tag carries the pin: the Go version AND the runtime uid, because the uid is
+    # baked at build time (see the Dockerfile). A host with a different user gets
+    # a different tag rather than silently reusing an image whose /state is owned
+    # by someone else.
+    image: nunet-tools/nostr-mailbox:go1.22-uid${HOST_UID:-1000}
     build:
+      # Absolute host path via AVATAR_ROOT. Relative paths would resolve against
+      # the FIRST folded compose file's directory (harness/<harness>/), not this
+      # one, so they are avoided throughout.
       context: ${AVATAR_ROOT}/tools/nostr-mailbox
+      args:
+        MAILBOX_UID: ${HOST_UID:-1000}
+        MAILBOX_GID: ${HOST_GID:-1000}
+    # Build it; never ask a registry. No component here publishes an image yet.
     pull_policy: build
-    container_name: mailbox-${AGENT_NETWORK:-undergryd-software-engineer}
+    # Run as the host user, matching the uid baked into the image, so the host
+    # binds below are writable. Belt and braces: correct even if the image is
+    # later replaced by a published one built for a different default.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # Container names are GLOBAL on the host, so the network suffix keeps two
+    # avatars' stacks from colliding.
+    container_name: mailbox-${AGENT_NETWORK:-avatar}
     init: true
     environment:
-      MAILBOX_AVATAR: ${AGENT_NETWORK:-undergryd-software-engineer}
+      # This avatar's name AS IT APPEARS IN registry.json -- the sender identity
+      # on every message it signs. Required, not defaulted: a wrong name here is
+      # silent misdelivery, which docs/design.md §13 says must fail loud instead.
+      MAILBOX_AVATAR: ${MAILBOX_AVATAR:?export MAILBOX_AVATAR (this avatar's name in registry.json)}
       # Private key, from pass via harness/config SANDBOX_SECRETS. Never logged. Fails
       # loud at start if unset (config.go) rather than binding a keyless mailbox.
       NOSTR_MAILBOX_NSEC: ${NOSTR_MAILBOX_NSEC:?export NOSTR_MAILBOX_NSEC (pass; maintainer-minted)}
@@ -37,9 +64,11 @@ services:
       # so the git-tracked record + boot "read inbox" habit keep working.
       - ${MAILBOX_INBOX_HOST_PATH:?export MAILBOX_INBOX_HOST_PATH (the avatar's inbox/)}:/mail/inbox
       - ${MAILBOX_OUTBOX_HOST_PATH:?export MAILBOX_OUTBOX_HOST_PATH (the avatar's outbox/)}:/mail/outbox
-      # Per-avatar mutable state: index.json + cursor.
+      # Per-avatar mutable state: index.json + cursor. The Dockerfile creates
+      # /state owned by the runtime uid -- without that, this fresh named volume
+      # comes up root-owned and the mailbox cannot write.
       - mailbox-state:/state
-      # Shared, read-only contacts/identity map (avatar-builder-provisioned).
+      # Shared, read-only contacts/identity map (from the nostr-relay component).
       - ${MAILBOX_REGISTRY_HOST_PATH:?export MAILBOX_REGISTRY_HOST_PATH (shared registry.json)}:/config/registry.json:ro
     restart: unless-stopped
     networks:
@@ -48,12 +77,12 @@ services:
 
 volumes:
   mailbox-state:
-    name: ${AGENT_NETWORK:-undergryd-software-engineer}-mailbox-state
+    name: ${AGENT_NETWORK:-avatar}-mailbox-state
 
 networks:
   agent:
-    name: ${AGENT_NETWORK:-undergryd-software-engineer}
-  # Provisioned by avatar-builder (relay/docker-compose.yml); shared across avatars.
+    name: ${AGENT_NETWORK:-avatar}
+  # Provisioned by the tools/nostr-relay component; shared across avatars.
   relay:
     external: true
     name: nostr-mailbox-net

@@ -2,7 +2,7 @@
 name: mailbox
 description: Send and read messages to/from other avatars over the shared Nostr mailbox, instead of hand-copying files between inbox/outbox dirs. Thin, keyless wrapper over this avatar's mailbox container (which holds the key and signs). Use to message another avatar by name, check unread/postponed mail, reply in a thread, or mark a message's status. Falls back to reading inbox/ files directly if the mailbox container is down.
 version: 0.1.0
-author: undergryd-software-engineer (avatar-local; Undergryd stack)
+author: undergryd-software-engineer (authored v1; now the tools/nostr-mailbox component)
 metadata:
   hermes:
     tags: [messaging, nostr, mailbox, inter-avatar, a2a, inbox, outbox]
