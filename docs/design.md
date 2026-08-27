@@ -151,8 +151,17 @@ the CLI presents it). The container rejects unauthenticated calls. Defense-in-de
 only the legitimate agent can make its mailbox sign/send.
 
 ### 4.6 Identity registry vs message-state index (two different stores)
-- **`registry.json`** — *shared, avatar-builder-owned, read-only, public*: the **contacts
-  / identity** record (§5). Maps name → identity. This is discovery.
+- **`registry.json`** — the **contacts / identity** record (§5). Maps name → identity.
+  This is discovery.
+
+  > **Amended 2026-08-26.** v1 described this as one shared file, read-only-mounted
+  > into every mailbox. That only works while the whole fleet shares a filesystem,
+  > which is exactly the assumption this fabric exists to break — and the read-only
+  > mount protected nothing, since an agent that wants to reach a given key can
+  > address it directly without consulting any address book. **Each avatar now holds
+  > its own writable copy**, materialized at build/update time from the operator's
+  > master copy (`scripts/build-registry`, generated out of `pass`). Authority lives
+  > in the signature, not in this file.
 - **`.mailbox/index.json`** — *per-avatar, local, mutable*: the **message-state** index.
   One record per message with status + metadata:
   ```json

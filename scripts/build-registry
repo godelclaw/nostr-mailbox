@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Build the address book (registry.json) from the keys already in pass, and print
+# it on stdout. MAINTAINER-run, host-side.
+#
+#   scripts/build-registry <avatar> [avatar...] > registry.json
+#
+# It is a plain name -> identity map: which name goes with which key, used to
+# address an outgoing message and to name the sender of an incoming one. Not a
+# control surface -- the signature is what makes a message trustworthy, not this
+# file. Each avatar gets a COPY it owns and can extend; there is no shared
+# original to mount, because avatars will not always share a filesystem.
+#
+# Needs pass on the host. Reads only the PUBLIC entries.
+set -euo pipefail
+
+PASS_PREFIX="${PASS_PREFIX:-nunet/avatars}"
+
+[ $# -gt 0 ] || { echo "usage: $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
+
+printf '{\n'
+sep=""
+for avatar in "$@"; do
+    npub=$(pass show "$PASS_PREFIX/$avatar/nostr-npub" | head -1)
+    hex=$(pass show "$PASS_PREFIX/$avatar/nostr-pubkey-hex" | head -1)
+    printf '%s  "%s": { "npub": "%s", "pubkey_hex": "%s", "did:key": "", "dids": [], "display": "%s" }' \
+        "$sep" "$avatar" "$npub" "$hex" "$avatar"
+    sep=$',\n'
+done
+printf '\n}\n'

@@ -68,8 +68,13 @@ services:
       # /state owned by the runtime uid -- without that, this fresh named volume
       # comes up root-owned and the mailbox cannot write.
       - mailbox-state:/state
-      # Shared, read-only contacts/identity map (from the nostr-relay component).
-      - ${MAILBOX_REGISTRY_HOST_PATH:?export MAILBOX_REGISTRY_HOST_PATH (shared registry.json)}:/config/registry.json:ro
+      # The address book -- THIS AVATAR'S OWN COPY, materialized with the rest of
+      # the component, not a mount of one shared original: avatars will not always
+      # share a filesystem with each other or with the relay. Writable, because a
+      # contact list is something its holder may extend. It carries no authority --
+      # a message is trusted because it verifies, not because of what this file
+      # says. scripts/build-registry generates it from the keys in pass.
+      - ${AVATAR_ROOT}/tools/nostr-mailbox/registry.json:/config/registry.json
     restart: unless-stopped
     networks:
       - agent
