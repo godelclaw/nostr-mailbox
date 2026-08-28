@@ -90,11 +90,44 @@ flowchart TB
 | container | networks | always-on? | mounts / secrets | ports |
 |---|---|---|---|---|
 | `nostr-relay` | `nostr-mailbox-net` | **yes** (buffers mail) | vol `relay-db` | WS (shared net; host port optional for debug) |
-| `mailbox-<avatar>` | `<avatar>` **+** `nostr-mailbox-net` | no (up with the avatar) | `inbox/`,`outbox/`,`.mailbox/` rw; `registry.json` ro; `NOSTR_MAILBOX_NSEC`, `MAILBOX_API_TOKEN` | `8787` on avatar net |
+| `mailbox-<avatar>` | `<avatar>` **+** `nostr-mailbox-net` (both **external** to it) | no — **its own compose project**, started by `mailboxctl`, never folded into the avatar's stack | `inbox/`,`outbox/` rw; `registry.json` rw; state volume; `NOSTR_MAILBOX_NSEC`, `MAILBOX_API_TOKEN` | `8787` on avatar net |
 
 **Key isolation:** the `nsec` lives **only inside the mailbox container**, which does
 all Nostr signing. The CLI skill holds no key. This is the v1 stand-in for nuActor's
 SecurityContext-in-allocation (§10).
+
+> **The `nsec` must never appear in the harness's `SANDBOX_SECRETS`.** That list is
+> injected into the **agent** container's environment (`hc__parse_secrets` builds an
+> `environment:` block for the agent service), so an entry there leaves the avatar's
+> private key readable by the LLM for the whole session — the exact opposite of the
+> property above. It happened: both live avatars carried `NOSTR_MAILBOX_NSEC` in
+> `SANDBOX_SECRETS` after a boot hot-patch, and the key was confirmed present in a
+> running agent's environment on 2026-08-28.
+>
+> `mailboxctl` resolves the key from `pass` host-side and hands it to the mailbox
+> container alone. The agent gets **`MAILBOX_API_TOKEN` only** — that authorizes
+> calls to a local API and signs nothing.
+
+### 3.3 Why the mailbox is a separate compose project
+
+A harness folds every `tools/*/docker-compose.yml` in the avatar into the *agent's*
+compose invocation. Under that name the mailbox became part of the agent's stack,
+and two properties of this component then became boot blockers for the **agent**:
+
+- **the external relay network** — Compose validates external networks before it
+  starts anything, so a relay that was not up failed the whole stack;
+- **the build context** — a Go build error was an avatar boot error.
+
+Mail is not on the critical path of an agent starting up. So the file is called
+`mailbox.compose.yml` (unfoldable by that glob) and runs as its own project,
+`mailbox-<avatar>`, via `./mailboxctl`. **Both** networks are external to it, so
+every dependency points *from* the mailbox *to* what it needs and never back: the
+mailbox needs the avatar's network and the relay's; neither needs the mailbox. A
+mailbox that is broken, absent or mid-rebuild is invisible to the agent — the CLI
+simply cannot reach `:8787`.
+
+Building is also out of `up`: `mailboxctl build` is explicit, so a rebuild is a
+decision rather than a side effect of starting.
 
 ## 4. Components
 
@@ -304,8 +337,8 @@ container-as-key-holder. **Changes, in order:**
   and the **relay-down policy** (lean: fail loud on send; the `outbox/` copy is written
   so nothing is lost; resend manual in v1). Reviewable without code.
 - **P2 — build** the Go mailbox container + thin CLI skill under `tools/nostr-mailbox/`
-  (+ `docker-compose.yml` for the container). I can't run docker/Go in-sandbox → build +
-  manual review + host-side compile; real exec proof is P4.
+  (+ `mailbox.compose.yml` and `mailboxctl` for the container). Build + manual review +
+  host-side compile; real exec proof is P4.
 - **P3 — avatar-builder handoff:** relay + shared network + container wiring + the
   maintainer key-mint block + registry provisioning + `nsec`/token injection.
 - **P4 — acceptance run** (host-side, joint with avatar-builder): §12.
