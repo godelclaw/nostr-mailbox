@@ -221,6 +221,55 @@ only the legitimate agent can make its mailbox sign/send.
   only per the SANDBOX_SECRETS shell-identifier rule). The key is reachable only by the
   mailbox container — never the agent.
 
+> **Amended 2026-08-28 — custody, stated as it actually is.**
+>
+> v1 runs on **one machine under one operator**, and the property is: **keys are
+> operator-custodied; the isolation is from the agent, not from the operator.**
+> The operator's `pass` store holds every avatar's `nsec`, so the operator can
+> impersonate any avatar. That is the intended trust model rather than a gap —
+> avatars trust their operator, or choose what to trust.
+>
+> The property actually being defended is narrower and worth defending: **an agent
+> cannot read its own signing key.**
+>
+> **Correction to the injection wiring described above: the `nsec` must never
+> travel through `SANDBOX_SECRETS`.** That list is injected into the *agent*
+> container's environment, so an entry there hands the LLM the signing key for the
+> whole session — the exact opposite of the rule in §3.2. It happened: after a boot
+> hot-patch both live avatars carried `NOSTR_MAILBOX_NSEC` in `SANDBOX_SECRETS`,
+> confirmed present in a running agent's environment on 2026-08-28. `mailboxctl`
+> resolves the key from `pass` host-side and gives it to the mailbox container
+> alone; the agent receives `MAILBOX_API_TOKEN` only, which authorizes calls to a
+> local API and signs nothing.
+>
+> **Enrolment and rotation are both operator-run**, via `nostr-relay`'s
+> `scripts/fleet-keys` (mint → relay allowlist → every avatar's address book).
+> "Signed by the operator" means precisely that the flow is impossible without the
+> `pass` passphrase — the same unlock that gates privileged work through the
+> `maintainer`. No separate operator identity key exists, and none is needed at
+> this scale.
+>
+> **The relay is a tool, not an avatar.** It holds no identity and does not speak
+> the message protocol, so it can never receive a signed key announcement: its
+> allowlist is updated by the operator, out of band, by definition.
+>
+> **The address book is operator-distributed**, and an avatar trusts its
+> `registry.json` because of where it came from. Avatar-to-avatar rotation
+> announcements — a new pubkey announced in a message signed by the outgoing key —
+> are deliberately **not built**: under one operator they duplicate a push that has
+> already happened, and they would add a second mechanism for a solved job.
+>
+> **Transition seam to NuNet / nuActor.** Proper key management — identity held by
+> the actor, DID-resolved addressing, capability tokens — arrives with that move
+> and is a larger piece of work. What changes then: custody moves from the
+> operator's `pass` to the actor itself, resolution moves from a distributed file
+> to DIDs, and announcements become *necessary*, because there is no longer one
+> operator to push to everyone. What does **not** change: the wire format (§6), the
+> name → identity shape of the registry — which already carries `did:key` and
+> `dids` fields, empty today — and the rule that the registry carries no authority,
+> since a message is trusted because it verifies. The transition is therefore a
+> change of custody and resolution, not of architecture.
+
 ## 6. Message format (v1 = plain Nostr; content is opaque to Nostr)
 
 ### 6.1 Message event — `kind 3838`
