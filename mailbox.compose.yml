@@ -1,0 +1,101 @@
+# nostr-mailbox -- the per-avatar mailbox, as a STANDALONE compose project.
+#
+# NOT named docker-compose.yml, and that is load-bearing. A harness folds every
+# `tools/*/docker-compose.yml` in the avatar into the agent's own compose
+# invocation, so under that name this file became part of the agent's stack --
+# and two things in it could then stop the AGENT from booting:
+#
+#   * an `external` network. Compose validates it before starting anything, so a
+#     missing relay network failed the whole stack, agent included.
+#   * a build context. A Go build error was an avatar boot error.
+#
+# Neither is acceptable for a mailbox: mail is not on the critical path of an
+# agent starting up. So the mailbox is its own project that the avatar merely
+# TALKS TO. Every dependency now points FROM the mailbox TO what it needs -- both
+# networks are external here -- and never back. A mailbox that is broken, absent
+# or mid-rebuild is invisible to the agent; the CLI simply cannot reach :8787.
+#
+# Run it with ./mailboxctl (up|down|build|logs|status), never with a bare
+# `docker compose up` -- the script resolves the avatar's identity, paths, uid and
+# the key, which are exactly what must not be guessed.
+#
+# The image is NOT built here. `mailboxctl build` builds it explicitly, so a
+# rebuild is a decision rather than a side effect of starting.
+services:
+  mailbox:
+    # Tag carries the pin: the Go version AND the runtime uid, because the uid is
+    # baked at build time (see the Dockerfile). A host with a different user gets
+    # a different tag rather than silently reusing an image whose /state is owned
+    # by someone else.
+    image: ${MAILBOX_IMAGE:-nunet-tools/nostr-mailbox:go1.22-uid${HOST_UID:-1000}}
+    # Never reach for a registry: no component here publishes an image yet, and a
+    # missing image should say so rather than hang on a pull that cannot succeed.
+    pull_policy: never
+    # Run as the host user, matching the uid baked into the image, so the host
+    # binds below are writable.
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    # Container names are GLOBAL on the host, so the avatar suffix keeps two
+    # avatars' mailboxes from colliding.
+    container_name: mailbox-${MAILBOX_AVATAR:?}
+    init: true
+    environment:
+      # This avatar's name AS IT APPEARS IN registry.json -- the sender identity on
+      # every message it signs. Required, never defaulted: a wrong name here is
+      # silent misdelivery, which docs/design.md 13 says must fail loud instead.
+      MAILBOX_AVATAR: ${MAILBOX_AVATAR:?}
+      # The signing key, resolved from `pass` by mailboxctl and given to THIS
+      # container only.
+      #
+      # It must never travel through the harness's SANDBOX_SECRETS: that injects
+      # every entry into the AGENT container's environment, which would leave the
+      # avatar's private key readable by the LLM for a whole session and break the
+      # key isolation this component exists to provide (docs/design.md 3.2). The
+      # agent gets MAILBOX_API_TOKEN and nothing else.
+      NOSTR_MAILBOX_NSEC: ${NOSTR_MAILBOX_NSEC:?mailboxctl resolves this from pass}
+      # Bearer token shared with the CLI in the agent. Authorizes calls to a local
+      # API; signs nothing.
+      MAILBOX_API_TOKEN: ${MAILBOX_API_TOKEN:?}
+      # Relay list (v1: the one shared hub on nostr-mailbox-net).
+      NOSTR_MAILBOX_RELAYS: ${NOSTR_MAILBOX_RELAYS:-ws://nostr-relay:8080}
+      MAILBOX_REGISTRY: /config/registry.json
+      MAILBOX_STATE_DIR: /state
+      MAILBOX_INBOX: /mail/inbox
+      MAILBOX_OUTBOX: /mail/outbox
+      MAILBOX_API_ADDR: ":8787"
+    volumes:
+      # The avatar's real inbox/ and outbox/, so the git-tracked record and the
+      # boot "read the inbox" habit keep working unchanged.
+      - ${MAILBOX_INBOX_HOST_PATH:?}:/mail/inbox
+      - ${MAILBOX_OUTBOX_HOST_PATH:?}:/mail/outbox
+      # Per-avatar mutable state: index.json + cursor. The Dockerfile creates
+      # /state owned by the runtime uid -- without that, a fresh named volume comes
+      # up root-owned and the mailbox cannot write.
+      - mailbox-state:/state
+      # The address book -- THIS AVATAR'S OWN COPY, not a mount of one shared
+      # original: avatars will not always share a filesystem with each other or
+      # with the relay. Writable, because a contact list is something its holder
+      # may extend. It carries no authority -- a message is trusted because it
+      # verifies, not because of what this file says.
+      - ${MAILBOX_REGISTRY_HOST_PATH:?}:/config/registry.json
+    restart: unless-stopped
+    networks:
+      - agent
+      - relay
+
+volumes:
+  mailbox-state:
+    name: mailbox-${MAILBOX_AVATAR:?}-state
+
+networks:
+  # The AVATAR's own network, owned by the avatar's compose stack -- external
+  # here. This is the dependency direction that matters: the mailbox needs the
+  # avatar to be up, and the avatar never needs the mailbox. If the avatar is
+  # down, `mailboxctl up` fails and says so; the agent is untouched either way.
+  agent:
+    external: true
+    name: ${AGENT_NETWORK:?}
+  # Provisioned by the tools/nostr-relay component; shared across the fleet and
+  # brought up independently of any avatar.
+  relay:
+    external: true
+    name: ${MAILBOX_RELAY_NETWORK:-nostr-mailbox-net}

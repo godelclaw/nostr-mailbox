@@ -21,9 +21,23 @@ a *client* of that relay — it connects to it, it does not contain it.
 | `nostr-rs-relay` + shared `registry.json` | always-on store-and-forward buffer + contacts map | **`nostr-relay` component** (separate repo) |
 
 The container is **dual-homed**: the avatar's docker network (so the CLI reaches
-`:8787`) and the shared `nostr-mailbox-net` (so it reaches the `nostr-relay`). It is
-**on-demand** — up with the avatar; on start it fetches everything missed since its
-cursor. Only the relay is always-on.
+`:8787`) and the shared `nostr-mailbox-net` (so it reaches the `nostr-relay`). Both
+are **external** to it. It runs as **its own compose project**, never folded into
+the avatar's stack — see `docs/design.md` §3.3 — so a mailbox problem can never stop
+the agent from booting. On start it fetches everything missed since its cursor. Only
+the relay is always-on.
+
+```bash
+cd <avatar>/tools/nostr-mailbox
+./mailboxctl build     # explicit; `up` never builds
+./mailboxctl up        # needs the avatar up (its network) and the relay up
+./mailboxctl status
+```
+
+**The `nsec` never goes in `SANDBOX_SECRETS`.** That list is injected into the
+*agent's* environment, which would hand the LLM the avatar's signing key.
+`mailboxctl` reads it from `pass` and gives it to the mailbox container only; the
+agent gets `MAILBOX_API_TOKEN` and nothing else.
 
 ## Wire spec (frozen — P1)
 
@@ -88,7 +102,8 @@ avatar's own docker network) and `MAILBOX_API_TOKEN`.
 
 ## Build / run
 
-`docker-compose.yml` builds the Go container (pinned tag, `pull_policy: build`). The
+`mailboxctl build` builds the Go container (pinned tag); `mailbox.compose.yml` only
+ever runs it (`pull_policy: never`), so starting the mailbox cannot trigger a build. The
 shared relay + network are the separate **`nostr-relay`** component (provisioned by
 avatar-builder). **Agents never mint keys** — the operator mints per avatar and stores the
 `nsec` in `pass`; see the `nostr-relay` component `MAINTAINER.md`. `scripts/mint-avatar-keys
