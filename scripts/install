@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# Install (or re-install) this component into an avatar.
+#
+#   scripts/install <avatar-dir> [--dry-run]
+#
+# Re-runnable: it is also how an avatar picks up a fixed component, and how one
+# carrying the old Go-container copy is upgraded.
+set -euo pipefail
+
+SRC="$(cd "$(dirname "$0")/.." && pwd)"
+AV="${1:?usage: install <avatar-dir> [--dry-run]}"
+DRY=0; [[ "${2:-}" == "--dry-run" ]] && DRY=1
+[[ -d "$AV/harness" ]] || { echo "install: no harness/ in $AV -- is this an avatar?" >&2; exit 1; }
+
+run() { (( DRY )) && { echo "  $*"; return; }; "$@"; }
+
+# The v1 container's files. An avatar that still has them would otherwise keep a
+# compose file a harness folds into the agent's own stack -- the boot blocker this
+# component was rebuilt to remove.
+for stale in mailbox.compose.yml mailboxctl config Dockerfile go.mod go.sum cli \
+             main.go mailbox.go store.go api.go relay.go identity.go config.go util.go; do
+    [[ -e "$AV/tools/nostr-mailbox/$stale" ]] && run rm -rf "$AV/tools/nostr-mailbox/$stale"
+done
+
+run mkdir -p "$AV/tools/nostr-mailbox" "$AV/skills/mailbox"
+run cp "$SRC/mailbox"                   "$AV/tools/nostr-mailbox/mailbox"
+run cp "$SRC/skills/mailbox/SKILL.md"   "$AV/skills/mailbox/SKILL.md"
+
+# registry.json is per-avatar and generated (scripts/build-registry); never clobber
+# one that is already there.
+if [[ -f "$AV/tools/nostr-mailbox/registry.json" ]]; then
+    echo "  registry.json present, left alone"
+elif [[ -f "$SRC/registry.json" ]]; then
+    run cp "$SRC/registry.json" "$AV/tools/nostr-mailbox/registry.json"
+else
+    echo "  NOTE: no registry.json -- generate one: scripts/build-registry <avatar...> > $AV/tools/nostr-mailbox/registry.json"
+fi
+
+# The symlink is resolved INSIDE the container, so it must point at the container
+# path (/project/...), never at wherever this repo happens to sit on the host.
+for bin in "$AV"/harness/*/home/.local/bin; do
+    [[ -d "$bin" ]] || continue
+    run ln -sfn /project/tools/nostr-mailbox/mailbox "$bin/mailbox"
+    echo "  linked $(basename "$(dirname "$(dirname "$(dirname "$bin")")")"):  mailbox"
+done
+# skills/ needs no link: register-skills symlinks it into each harness at boot.
+
+grep -q 'NOSTR_MAILBOX_NSEC' "$AV/harness/config" 2>/dev/null \
+    || echo "  TODO: add \"NOSTR_MAILBOX_NSEC=pass:nunet/avatars/<avatar>/nostr-nsec\" to SANDBOX_SECRETS in $AV/harness/config"
+grep -q 'MAILBOX_API_TOKEN' "$AV/harness/config" 2>/dev/null \
+    && echo "  TODO: remove MAILBOX_API_TOKEN from $AV/harness/config -- it guards nothing now"
+
+echo "install: done$( (( DRY )) && echo ' (dry run)'). Next: git add + commit in the avatar, then \`mailbox doctor\` inside it."
