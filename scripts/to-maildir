@@ -1,0 +1,123 @@
+#!/usr/bin/env bash
+# to-maildir -- move an avatar's inbox/ and outbox/ into a Maildir, once.
+#
+#   scripts/to-maildir <avatar-dir> [--dry-run]
+#
+# Most of what it converts was never a Nostr message. Avatars messaged each other
+# by hand-copying markdown into each other's inbox/ long before the relay existed,
+# so those files have no envelope at all -- no event id, no signature, nothing but
+# a descriptive filename. They are converted with headers synthesised from that
+# filename and marked `X-Mailbox-Origin: file-copy`, so the archive never implies
+# a signature that was never there. Files that DO carry the mailbox's YAML
+# frontmatter keep their real event id, date and signature.
+#
+# Originals are left in place. Removing them is a git operation the operator does
+# deliberately, not a side effect of a conversion script.
+set -euo pipefail
+
+AV="${1:?usage: to-maildir <avatar-dir> [--dry-run]}"
+DRY=0; [[ "${2:-}" == "--dry-run" ]] && DRY=1
+[[ -d "$AV" ]] || { echo "to-maildir: no such directory: $AV" >&2; exit 1; }
+
+NAME="$(sed -n 's/^[[:space:]]*AVATAR_NAME=//p' "$AV/harness/config" 2>/dev/null | head -1 | tr -d "\"'")"
+NAME="${NAME:-$(basename "$AV")}"
+MAIL="$AV/mail"
+
+# Peer names and subject slugs are both dash-separated in the old filenames
+# (2026-07-23-from-undergryd-software-engineer-runtime-toolchain-sidecars), so the
+# split between them cannot be guessed -- it has to be looked up. Longest match
+# wins, so a name that is a prefix of another cannot claim its messages.
+REG="$AV/tools/nostr-mailbox/registry.json"
+declare -a KNOWN=() UNRESOLVED=()
+if [[ -f "$REG" ]] && command -v jq >/dev/null; then
+    mapfile -t KNOWN < <(jq -r 'keys[]' "$REG" | awk '{print length"\t"$0}' | sort -rn | cut -f2)
+fi
+
+split_peer() { # <remainder-after-from/to->  -> peer name on stdout
+    local rest="$1" k
+    for k in "${KNOWN[@]}"; do
+        [[ "$rest" == "$k-"* || "$rest" == "$k" ]] && { printf '%s' "$k"; return; }
+    done
+    # Not in the registry -- an avatar that never got a key, most likely. The first
+    # token is the best guess and is probably truncated. The caller records it;
+    # this runs in a command substitution, so anything appended here would be lost
+    # with the subshell.
+    printf '%s' "${rest%%-*}"
+}
+
+known_peer() { local k; for k in "${KNOWN[@]}"; do [[ "$1" == "$k" ]] && return 0; done; return 1; }
+
+emit() { (( DRY )) && { echo "  would write $1"; return; }; cat > "$1"; }
+
+convert() { # <file> <in|out>
+    local f="$1" dir="$2" base id date_hdr subject peer verb fm
+    base="$(basename "$f" .md)"
+    id="$(sha1sum "$f" | cut -c1-40)"
+
+    if head -1 "$f" | grep -q '^---$'; then
+        # A real mailbox message: take the envelope it already carries.
+        fm="$(sed -n '2,/^---$/p' "$f" | sed '$d')"
+        local ev; ev=$(sed -n 's/^event_id:[[:space:]]*//p' <<<"$fm" | head -1)
+        [[ -n "$ev" ]] && id="$ev"
+        subject=$(sed -n 's/^subject:[[:space:]]*//p' <<<"$fm" | head -1 | tr -d '"')
+        peer=$(sed -n "s/^$( [[ $dir == in ]] && echo from_name || echo to_name ):[[:space:]]*//p" <<<"$fm" | head -1)
+        date_hdr=$(sed -n 's/^created_at:[[:space:]]*//p' <<<"$fm" | head -1)
+        date_hdr="$(date -u -R -d "$date_hdr" 2>/dev/null || date -u -R)"
+        body="$(sed '1,/^---$/d' "$f" | sed '1,/^---$/d')"
+        origin="nostr"
+    else
+        # The file-copy era. Everything comes from the filename and the first heading.
+        # 2026-08-27-from-<peer>-<slug>  |  2026-08-25-to-<peer>-<slug>
+        local d; d="$(grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2}' <<<"$base" || true)"
+        date_hdr="$(date -u -R -d "${d:-1970-01-01}" 2>/dev/null || date -u -R)"
+        verb="$(grep -oE -- '-(from|to)-' <<<"$base" | head -1 | tr -d '-')"
+        local rest; rest="$(sed -E 's/^[0-9-]{10}-(from|to)-//' <<<"$base")"
+        peer="$(split_peer "$rest")"
+        known_peer "$peer" || UNRESOLVED+=( "$peer  (from $base)" )
+        subject="$(grep -m1 '^# ' "$f" | sed 's/^# *//' || true)"
+        [[ -n "$subject" ]] || subject="$(sed -E 's/^[0-9-]{10}-(from|to)-[a-z0-9-]+-//; s/-/ /g' <<<"$base")"
+        body="$(cat "$f")"
+        origin="file-copy"
+    fi
+    [[ -n "$peer" ]] || peer="unknown"
+
+    local folder flags out
+    if [[ "$dir" == in ]]; then folder="$MAIL"; else folder="$MAIL/.Sent"; fi
+    flags="S"
+    out="$folder/cur/$(date -d "$date_hdr" +%s 2>/dev/null || echo 0).$id.$NAME:2,$flags"
+
+    emit "$out" <<EOF
+Message-ID: <$id@nostr>
+Date: $date_hdr
+From: $( [[ $dir == in ]] && echo "$peer" || echo "$NAME" ) <$( [[ $dir == in ]] && echo "$peer" || echo "$NAME" )@nostr>
+To: $( [[ $dir == in ]] && echo "$NAME" || echo "$peer" ) <$( [[ $dir == in ]] && echo "$NAME" || echo "$peer" )@nostr>
+Subject: $subject
+X-Mailbox-Origin: $origin
+X-Mailbox-Converted-From: $(basename "$f")
+MIME-Version: 1.0
+Content-Type: text/markdown; charset=utf-8
+
+$body
+EOF
+}
+
+(( DRY )) || mkdir -p "$MAIL"/{tmp,new,cur} "$MAIL"/.Sent/{tmp,new,cur}
+
+n=0
+for f in "$AV"/inbox/*.md;  do [[ -e "$f" ]] || continue; convert "$f" in;  n=$((n+1)); done
+for f in "$AV"/outbox/*.md; do [[ -e "$f" ]] || continue; convert "$f" out; n=$((n+1)); done
+
+echo "to-maildir: $n message(s)$( (( DRY )) && echo ' would be' || echo '') converted into $MAIL"
+if (( ${#UNRESOLVED[@]} )); then
+    printf '\nto-maildir: %d message(s) from a sender not in registry.json -- the From:\n' "${#UNRESOLVED[@]}"
+    printf '            header is a guess and is probably truncated. Add them to the\n'
+    printf '            registry and re-run, or fix these by hand:\n'
+    printf '  %s\n' "${UNRESOLVED[@]}" | sort -u
+fi
+(( DRY )) || cat <<EOF
+
+  The originals are untouched. When you are satisfied with $MAIL:
+
+      git -C "$AV" add mail && git -C "$AV" rm -r --cached -q inbox outbox
+      rm -rf "$AV/inbox" "$AV/outbox"
+EOF
