@@ -38,8 +38,21 @@ set -euo pipefail
 
 KIND_MESSAGE=3838
 
-: "${MAILBOX_AVATAR:?set MAILBOX_AVATAR to the name this avatar has in registry.json}"
 : "${AVATAR_ROOT:=/project}"
+
+# Identity comes from the avatar's own config, not from a directory name and not
+# from the environment -- nothing injects AVATAR_NAME into the agent container, and
+# a directory name, an AVATAR_NAME and a git remote are all allowed to disagree.
+# Same rule the old host-side mailboxctl used.
+if [[ -z "${MAILBOX_AVATAR:-}" && -f "$AVATAR_ROOT/harness/config" ]]; then
+    MAILBOX_AVATAR="$(sed -n 's/^[[:space:]]*AVATAR_NAME=//p' "$AVATAR_ROOT/harness/config" \
+                      | head -1 | tr -d "\"'")"
+fi
+[[ -n "${MAILBOX_AVATAR:-}" ]] || {
+    echo "mailbox: cannot tell which avatar this is." >&2
+    echo "  Looked for AVATAR_NAME in $AVATAR_ROOT/harness/config; set MAILBOX_AVATAR to override." >&2
+    exit 1
+}
 : "${MAILBOX_ROOT:=$AVATAR_ROOT/mail}"
 : "${MAILBOX_REGISTRY:=$AVATAR_ROOT/tools/nostr-mailbox/registry.json}"
 : "${NOSTR_MAILBOX_RELAY:=ws://nostr-relay:8080}"
