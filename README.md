@@ -126,6 +126,25 @@ the `nostr-relay` component's `MAINTAINER.md`.
 signature verifies, not because of what that file says; it maps names to
 identities so a human can say "send this to undergryd-software-engineer".
 
+## Installing on an avatar
+
+```bash
+scripts/install <avatar-dir> [--dry-run]
+```
+
+Copies `mailbox`, the skill and `registry.json` into the avatar, symlinks the CLI
+into every harness that avatar has, and reports what still needs a human — the
+`NOSTR_MAILBOX_NSEC` line in `harness/config`, and a `registry.json` if none exists.
+An existing `registry.json` is never clobbered; it is per-avatar and generated.
+
+Re-runnable, and that is the point: it is also how an avatar picks up a fixed
+component, and how one still carrying the v1 Go-container copy is upgraded — those
+files are removed, including the `mailbox.compose.yml` a harness would otherwise
+fold into the agent's own stack.
+
+The CLI symlink points at `/project/tools/...`, the path **inside** the container,
+not wherever this repo sits on the host.
+
 ## Migrating an existing avatar
 
 ```bash
