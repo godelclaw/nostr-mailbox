@@ -50,4 +50,16 @@ grep -q 'NOSTR_MAILBOX_NSEC' "$AV/harness/config" 2>/dev/null \
 grep -q 'MAILBOX_API_TOKEN' "$AV/harness/config" 2>/dev/null \
     && echo "  TODO: remove MAILBOX_API_TOKEN from $AV/harness/config -- it guards nothing now"
 
+# Body files for `mailbox send --body-file` live in the avatar's tmp/ and must
+# never be committed. Make the .gitignore say so: existing avatars repair
+# themselves here on re-install, new ones are born with it via the scaffold.
+if [[ -f "$AV/.gitignore" ]] && grep -qE '^/?tmp/?$' "$AV/.gitignore"; then
+    echo "  tmp/ already gitignored"
+elif (( DRY )); then
+    echo "  append 'tmp/' to $AV/.gitignore"
+else
+    printf '\n# mailbox --body-file scratch (ephemeral, never commit)\ntmp/\n' >> "$AV/.gitignore"
+    echo "  gitignored tmp/ in $AV/.gitignore"
+fi
+
 echo "install: done$( (( DRY )) && echo ' (dry run)'). Next: git add + commit in the avatar, then \`mailbox doctor\` inside it."

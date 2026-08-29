@@ -6,8 +6,8 @@
 #   mailbox fetch                               claim new mail from the relay
 #   mailbox list [--all]                        unread (default) or everything
 #   mailbox read <event-id>                     print it; marks it seen
-#   mailbox send <avatar> --subject S <body|->  sign + publish
-#   mailbox reply <event-id> <body|->           threaded reply
+#   mailbox send <avatar> --subject S [--body-file F | body]  sign + publish
+#   mailbox reply <event-id> [--body-file F | body]           threaded reply
 #
 # WHY THERE IS NO DAEMON
 #
@@ -64,12 +64,12 @@ nak_pubkey() { printf %s "$1" | nak key public; }           # sec -> pubkey-hex
 # one less place it is visible.
 export NOSTR_SECRET_KEY="${NOSTR_MAILBOX_NSEC:-}"
 
-nak_publish() { # <content-file> <to-hex> <subject> [<reply-to-id>]
+nak_publish() { # <content> <to-hex> <subject> [<reply-to-id>]
     local args=( event -k "$KIND_MESSAGE"
                  --tag "p=$2" --tag "subject=$3"
                  --tag "from_name=$MAILBOX_AVATAR" )
     [[ -n "${4:-}" ]] && args+=( --tag "e=$4;;reply" )
-    nak "${args[@]}" -c "$(cat "$1")" "$NOSTR_MAILBOX_RELAY"
+    nak "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
 }
 
 nak_fetch() { # -> one event JSON per line
@@ -158,7 +158,15 @@ render() { # event JSON on stdin -> RFC 5322 on stdout
 hdr() { sed -n "/^$2:/{s/^$2:[[:space:]]*//;p;q}" "$1"; }
 
 # ───────────────────────────────────────────────────────── commands ───────────
-read_body() { [[ "${1:-}" == "-" ]] && cat || printf '%s' "$1"; }
+# The body comes from an inline argument or --body-file, never from stdin. Stdin
+# was the one source whose EOF the caller controlled, so it could hang (stream
+# left open with no EOF) or sign an empty event (instant EOF) -- both removed by
+# not reading it. An inline argument is argv: it cannot hang and cannot EOF. The
+# guard below is on the resolved BODY, not the file, so an empty or
+# whitespace-only body is refused whichever way it arrived and is never signed.
+require_body() { # <body> -- dies if empty or whitespace-only
+    [[ -n "${1//[[:space:]]/}" ]] || die "refusing to send: the body is empty or only whitespace"
+}
 
 cmd_doctor() {
     local ok=0
@@ -226,25 +234,36 @@ cmd_read() {
 }
 
 cmd_send() {
-    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S <body|->"
+    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S [--body-file F | <inline body>]"
     local to="$1"; shift
-    local subject="" reply=""
+    local subject="" reply="" body_file=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --subject) subject="$2"; shift 2 ;;
-            --reply)   reply="$2"; shift 2 ;;
-            *)         break ;;
+            --subject)   subject="$2"; shift 2 ;;
+            --reply)     reply="$2"; shift 2 ;;
+            --body-file) body_file="$2"; shift 2 ;;
+            *)           break ;;
         esac
     done
+    # Body from --body-file OR one inline argument, never both, never stdin.
+    local body
+    if [[ -n "$body_file" ]]; then
+        [[ $# -eq 0 ]]        || die "give --body-file OR an inline body, not both"
+        [[ -f "$body_file" ]] || die "body file not found: $body_file"
+        body="$(cat "$body_file")"
+    elif [[ $# -gt 0 ]]; then
+        [[ $# -eq 1 ]] || die "inline body must be a single quoted argument (or use --body-file F)"
+        body="$1"
+    else
+        die "no body -- pass an inline body or --body-file F (write long bodies to /project/tmp/…)"
+    fi
+    require_body "$body"
     local to_hex
     to_hex="$(jq -r --arg n "$to" '.[$n].pubkey_hex // empty' "$MAILBOX_REGISTRY")"
     [[ -n "$to_hex" ]] || die "unknown recipient $to -- not in the registry; try: mailbox contacts"
     md_init
-    local body ev rc=0
-    body="$(mktemp)"
-    read_body "${1:-}" > "$body"
+    local ev rc=0
     ev="$(nak_publish "$body" "$to_hex" "$subject" "$reply")" || rc=$?
-    rm -f "$body"
     (( rc == 0 )) || die "publish failed -- nothing was sent and nothing was archived"
     local id created; id=$(jq -r '.id' <<<"$ev"); created=$(jq -r '.created_at' <<<"$ev")
     printf '%s' "$ev" | render | md_deliver "$SENT" "$id" "$created" "S" cur >/dev/null
@@ -252,7 +271,7 @@ cmd_send() {
 }
 
 cmd_reply() {
-    local f; f="$(md_find "${1:?usage: mailbox reply <event-id> <body|->}")"
+    local f; f="$(md_find "${1:?usage: mailbox reply <event-id> [--body-file F | <inline body>]}")"
     [[ -n "$f" ]] || die "no message with id ${1}"
     local parent peer subject
     parent="$(hdr "$f" X-Nostr-Event-Id)"
@@ -260,7 +279,7 @@ cmd_reply() {
     subject="$(hdr "$f" Subject)"
     [[ "$subject" == Re:* ]] || subject="Re: $subject"
     shift
-    cmd_send "$peer" --subject "$subject" --reply "$parent" "${1:--}"
+    cmd_send "$peer" --subject "$subject" --reply "$parent" "$@"
     # Replied is a Maildir flag, so the archive records it without a database.
     # Flags are stripped from the BASENAME -- a path may legitimately contain a colon.
     local base; base="$(basename "$f")"
@@ -275,6 +294,6 @@ case "${1:-doctor}" in
     read)     shift; cmd_read "$@" ;;
     send)     shift; cmd_send "$@" ;;
     reply)    shift; cmd_reply "$@" ;;
-    -h|--help|help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$1' (doctor|contacts|fetch|list|read|send|reply)" ;;
 esac
