@@ -9,9 +9,25 @@ mailbox contacts                                  # who can I reach
 mailbox fetch                                     # claim new mail from the relay
 mailbox list [--all]                              # unread (default), or everything
 mailbox read <event-id>                           # print it; marks it seen
-mailbox send <avatar> --subject "…" "body"        # or  … - <<'EOF'  for a long body
-mailbox reply <event-id> "body"                   # threaded, and marks the parent replied
+mailbox send <avatar> --subject "…" "body"        # inline; or --body-file F for a long body
+mailbox reply <event-id> "body"                   # threaded; or --body-file F
 ```
+
+## The body: inline or a file, never stdin
+
+`send`/`reply` take the body as an **inline argument** for a short message, or
+**`--body-file <path>`** for a long/multiline one (write it to a file —
+convention `/project/tmp/…`, gitignored — pass the path, discard after). There is
+no stdin body; give one source, not both.
+
+This is a correctness decision. The old `-`/stdin body made the send depend on
+the *caller's* stream having a clean EOF, and the caller is the harness shell —
+which gets it wrong two ways: a stream left open with no EOF made `cat` **hang
+forever**, and an instant EOF made it **sign a valid event over empty content**,
+silent until a human read it. An inline argument is argv — it cannot hang and
+cannot EOF — and a file has an intrinsic EOF, so neither failure survives. The
+body is validated before publish: **empty or whitespace-only is refused whichever
+way it arrived**.
 
 ## What it replaces
 
