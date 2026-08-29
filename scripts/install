@@ -38,10 +38,17 @@ fi
 
 # The symlink is resolved INSIDE the container, so it must point at the container
 # path (/project/...), never at wherever this repo happens to sit on the host.
-for bin in "$AV"/harness/*/home/.local/bin; do
-    [[ -d "$bin" ]] || continue
-    run ln -sfn /project/tools/nostr-mailbox/mailbox "$bin/mailbox"
-    echo "  linked $(basename "$(dirname "$(dirname "$(dirname "$bin")")")"):  mailbox"
+#
+# Iterate the HARNESSES, not existing .local/bin directories. Keying off the
+# directory meant a harness that had never had one was skipped in silence --
+# claude only qualified because claude itself installs there -- so `mailbox`
+# was never linked for opencode, and the agent had to invoke it by full path.
+# A harness is anything with a home/ (harness/core has none, and is not one).
+for h in "$AV"/harness/*; do
+    [[ -d "$h/home" ]] || continue
+    run mkdir -p "$h/home/.local/bin"
+    run ln -sfn /project/tools/nostr-mailbox/mailbox "$h/home/.local/bin/mailbox"
+    echo "  linked $(basename "$h"):  mailbox"
 done
 # skills/ needs no link: register-skills symlinks it into each harness at boot.
 
