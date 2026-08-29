@@ -140,8 +140,13 @@ signature that was never there. It warns about senders it cannot resolve against
 `registry.json` rather than writing a truncated name silently, and it leaves the
 originals in place — removing them is a git operation you do deliberately.
 
-## What is still Go
+## No Go anywhere
 
-`scripts/keygen` — a few lines run through docker by `scripts/mint-avatar-keys` on
-the **host**, never on an avatar. `nak key generate` can replace it; that is a
-follow-up, not a blocker.
+The component is four shell scripts, a skill and its docs. `scripts/mint-avatar-keys`
+was the last holdout — it ran a small Go program through docker to make a keypair —
+and now calls `nak key generate`, from either a host `nak` or straight from nak's
+module path through docker, pinned to the same commit the harness image builds. The
+minting side and the running side cannot be different code.
+
+The private key never leaves a shell variable and `pass`: not the screen, not the
+scrollback, not the shell history, and not any process's argv.

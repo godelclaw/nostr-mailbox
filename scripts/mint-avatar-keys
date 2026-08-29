@@ -1,48 +1,61 @@
 #!/usr/bin/env bash
 # Mint a Nostr keypair per avatar and store it in pass. MAINTAINER-run, host-side:
-# agents never touch private keys (docs/design.md R2-Q5).
+# agents never mint their own identity.
 #
 #   scripts/mint-avatar-keys <avatar> [avatar...]
 #
-# Per avatar it writes four pass entries -- everything about that identity lives
+# Per avatar it writes three pass entries -- everything about that identity lives
 # in pass, nowhere else:
 #
-#   <prefix>/<avatar>/nostr-nsec           private key, 64-char hex (container
-#                                          accepts hex or nsec1)
-#   <prefix>/<avatar>/nostr-pubkey-hex     public key -> relay pubkey_whitelist
-#   <prefix>/<avatar>/nostr-npub           public key, bech32 -> registry.json
-#   <prefix>/<avatar>/mailbox-api-token    the CLI<->container bearer
+#   <prefix>/<avatar>/nostr-nsec         private key, 64-char hex
+#   <prefix>/<avatar>/nostr-pubkey-hex   public key -> relay pubkey_whitelist
+#   <prefix>/<avatar>/nostr-npub         public key, bech32 -> registry.json
 #
-# The public parts are echoed too, since they are what gets copied into
-# registry.json and config.toml. The private key goes container stdout -> pass
-# stdin and is never printed.
+# The public parts are echoed, since they are what gets copied into registry.json
+# and config.toml. The private key is never printed: it lives in a shell variable
+# and goes to pass on stdin, so it reaches neither the screen, the scrollback, the
+# shell history, nor any process's argv.
 #
-# RE-RUNNING MINTS NEW KEYS and overwrites all four entries. An avatar already
-# published in registry.json + the relay allowlist must be re-published, or it
-# will fail to start: the container asserts the injected key matches its
-# registry entry.
+# RE-RUNNING MINTS NEW KEYS and overwrites the entries. An avatar already published
+# in registry.json and the relay allowlist must be re-published, or it will fail
+# its identity check: `mailbox doctor` asserts the injected key derives the pubkey
+# the registry claims for it. `nostr-relay/scripts/fleet-keys rotate` does both.
 #
-# Needs docker and pass on the host; no Go toolchain.
+# Needs `pass`, and either `nak` on the host or docker. No Go toolchain either way:
+# with docker it runs nak straight from its module path, pinned to the same commit
+# the harness image builds, so the minting side and the running side cannot be
+# different code.
 set -euo pipefail
 
 PASS_PREFIX="${PASS_PREFIX:-nunet/avatars}"
-GO_IMAGE="${GO_IMAGE:-golang:1.22-alpine}"
-REPO="$(cd "$(dirname "$0")/.." && pwd)"
+NAK_COMMIT="${NAK_COMMIT:-fb21939f45538eff414068fa1bb6f1bea705f447}"   # v0.20.6
+GO_IMAGE="${GO_IMAGE:-golang:1.25-alpine}"
 
 [ $# -gt 0 ] || { echo "usage: $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
 
+if command -v nak >/dev/null; then
+    nak_run() { nak "$@"; }
+else
+    command -v docker >/dev/null \
+        || { echo "mint-avatar-keys: needs nak or docker on the host" >&2; exit 1; }
+    # -i so `key public` can still read the secret from stdin rather than argv.
+    nak_run() {
+        docker run --rm -i -u "$(id -u):$(id -g)" -e HOME=/tmp \
+            "$GO_IMAGE" go run "github.com/fiatjaf/nak@$NAK_COMMIT" "$@"
+    }
+fi
+
 for avatar in "$@"; do
-    out=$(docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
-        -v "$REPO":/src -w /src "$GO_IMAGE" go run ./scripts/keygen)
+    sk="$(nak_run key generate)"
+    [ ${#sk} -eq 64 ] || { echo "mint-avatar-keys: nak did not return a 64-char key" >&2; exit 1; }
 
-    pubkey_hex=$(printf '%s\n' "$out" | awk '/^pubkey_hex/{print $3}')
-    npub=$(printf '%s\n' "$out" | awk '/^npub/{print $3}')
+    pubkey_hex="$(printf %s "$sk" | nak_run key public)"
+    npub="$(nak_run encode npub "$pubkey_hex")"
 
-    printf '%s\n' "$out" | awk '/^sk_hex/{print $3}' \
-        | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-nsec" >/dev/null
+    printf '%s\n' "$sk"         | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-nsec" >/dev/null
     printf '%s\n' "$pubkey_hex" | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-pubkey-hex" >/dev/null
     printf '%s\n' "$npub"       | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-npub" >/dev/null
-    pass generate -n -f "$PASS_PREFIX/$avatar/mailbox-api-token" 48 >/dev/null
+    unset sk
 
     printf '%-34s pubkey_hex=%s  npub=%s\n' "$avatar" "$pubkey_hex" "$npub"
 done
