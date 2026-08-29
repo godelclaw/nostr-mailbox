@@ -40,6 +40,12 @@ export HOST_UID="${HOST_UID:-$(id -u)}"
 export HOST_GID="${HOST_GID:-$(id -g)}"
 export MAILBOX_IMAGE="${MAILBOX_IMAGE:-nunet-tools/nostr-mailbox:go1.22-uid$HOST_UID}"
 
+# Where this avatar's secrets come from, declared in a file rather than implied by
+# a convention inside this script. Sourced AFTER MAILBOX_AVATAR is known, because
+# the paths are derived from it, and optional: the same values are the fallbacks
+# in load_secrets, so an avatar without the file behaves exactly as before.
+[[ -f "$HERE/config" ]] && . "$HERE/config"
+
 # One compose project per avatar's mailbox, separate from the avatar's own.
 COMPOSE=( docker compose -p "mailbox-$MAILBOX_AVATAR" -f "$COMPOSE_FILE" )
 
@@ -50,7 +56,9 @@ COMPOSE=( docker compose -p "mailbox-$MAILBOX_AVATAR" -f "$COMPOSE_FILE" )
 load_secrets() {
     command -v pass >/dev/null || die "'pass' is not installed on this host"
     # Same layout scripts/mint-avatar-keys writes, and the same PASS_PREFIX knob,
-    # so the minting side and the running side cannot drift apart.
+    # so the minting side and the running side cannot drift apart. These are only
+    # the fallbacks -- ./config sets the same three, and is where an avatar says
+    # so out loud; they fire only when that file has been deleted.
     : "${PASS_PREFIX:=nunet/avatars}"
     : "${MAILBOX_NSEC_PASS_PATH:=$PASS_PREFIX/$MAILBOX_AVATAR/nostr-nsec}"
     : "${MAILBOX_TOKEN_PASS_PATH:=$PASS_PREFIX/$MAILBOX_AVATAR/mailbox-api-token}"

@@ -39,6 +39,20 @@ cd <avatar>/tools/nostr-mailbox
 `mailboxctl` reads it from `pass` and gives it to the mailbox container only; the
 agent gets `MAILBOX_API_TOKEN` and nothing else.
 
+Which `pass` entries it reads is declared in **`./config`** beside `mailboxctl`,
+so an avatar states where its identity comes from instead of inheriting an
+unwritten convention:
+
+```bash
+: "${PASS_PREFIX:=nunet/avatars}"
+: "${MAILBOX_NSEC_PASS_PATH:=$PASS_PREFIX/$MAILBOX_AVATAR/nostr-nsec}"
+: "${MAILBOX_TOKEN_PASS_PATH:=$PASS_PREFIX/$MAILBOX_AVATAR/mailbox-api-token}"
+```
+
+Those are paths into `pass`, not secrets, so the file is committed. The values
+are also `mailboxctl`'s fallbacks — deleting the file changes nothing, and the
+environment still overrides both.
+
 ## Wire spec (frozen — P1)
 
 ### Message event — `kind 3838`
