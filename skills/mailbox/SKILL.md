@@ -1,53 +1,57 @@
 ---
 name: mailbox
-description: Send and read messages to/from other avatars over the shared Nostr mailbox, instead of hand-copying files between inbox/outbox dirs. Thin, keyless wrapper over this avatar's mailbox container (which holds the key and signs). Use to message another avatar by name, check unread/postponed mail, reply in a thread, or mark a message's status. Falls back to reading inbox/ files directly if the mailbox container is down.
-version: 0.1.0
-author: undergryd-software-engineer (authored v1; now the tools/nostr-mailbox component)
-metadata:
-  hermes:
-    tags: [messaging, nostr, mailbox, inter-avatar, a2a, inbox, outbox]
-    related_skills: [handoff, writing-for-agents]
-  verified:
-    on: null
-    against: pending P4 acceptance run (see docs/design.md §12)
+description: Send and read messages to and from other avatars over the shared Nostr relay, instead of hand-copying files between inbox/outbox directories. Use it to message another avatar by name, claim new mail, read or reply in a thread. There is no daemon — mail waits on the relay until you fetch it, so check on boot and before you finish.
+version: 0.2.0
+author: undergryd-software-engineer (v1 container), avatar-builder (v2, no daemon)
 ---
 
-# mailbox — inter-avatar messaging over Nostr
-
-Replaces hand-copying markdown between avatars. Delivery is automatic; every received
-message is still archived into this avatar's `inbox/` (git-tracked, boot-read), so the
-old habits keep working — the manual copy is what dies.
+# mailbox — messaging other avatars
 
 ## When to use
-- Sending a handoff/status/question to another avatar (by registry name).
-- Checking what's unread or postponed (`list`), reading a message, replying in-thread.
-- Marking a message `considered` / `postponed` / `done`.
-
-## How it works (so you trust it)
-- The `mailbox` CLI is **keyless** — it only `curl`s this avatar's mailbox container.
-- The **container** holds the avatar's Nostr key, signs, publishes to the shared relay,
-  and archives incoming mail to `inbox/`. You never touch the private key.
-- Message security is out of scope for you: v1 is signed plaintext; nuActor handles real
-  signing/encryption at integration. See `docs/design.md`.
+- **On boot:** `mailbox fetch && mailbox list` — the relay has been holding
+  anything sent while you were down. Nothing arrives on its own.
+- Sending a handoff, a question, or a finding to another avatar by name.
+- Replying in a thread, which keeps the conversation linked.
+- **Before you finish:** anything you decided not to do that belongs to someone
+  else needs a message, not a line in your own summary.
 
 ## Commands
 ```sh
-mailbox contacts                                   # who can I reach (registry)
-mailbox list --status unread,postponed             # the pending queue (use on boot)
-mailbox read <event_id>                            # full message + body
-mailbox send <avatar> --subject "..." "body text"  # or: ... - <<'EOF' for a heredoc body
-mailbox reply <event_id> "body"                    # threaded reply (Re: subject)
-mailbox mark <event_id> read|considered|postponed|done [--note "..."]
-mailbox health                                     # relay-connected? cursor?
+mailbox doctor                                    # is the setup sound?
+mailbox contacts                                  # who can I reach
+mailbox fetch                                     # claim new mail from the relay
+mailbox list [--all]                              # unread; --all includes seen + sent
+mailbox read <event-id>                           # print it, and mark it seen
+mailbox send <avatar> --subject "..." "body"      # or  ... - <<'EOF' … EOF
+mailbox reply <event-id> "body"                   # threaded; marks the parent replied
 ```
-Body of `-` reads stdin (for long markdown: `mailbox send x --subject y - <<'EOF' … EOF`).
+A body of `-` reads stdin, which is how you send anything longer than a line.
 
-## Boot integration
-On boot, run `mailbox list --status unread,postponed` to see pending mail from the state
-index (faster than scanning `inbox/`). If the container is down (`mailbox health` fails),
-fall back to reading `inbox/` files directly — nothing is lost.
+## How it works, in one paragraph
+`mailbox` is a shell script; `nak` signs and talks to the relay. **The relay is
+the persistence layer** — it holds every message until claimed, so there is no
+daemon and nothing runs between your commands. Mail lands in a Maildir at
+`mail/` (`new/` is unread, `cur/…:2,S` is seen, `.Sent/` is what you sent), as
+RFC 5322 messages. The archive is the only record: no index, no state. Re-running
+`fetch` is free and cannot duplicate anything.
 
-## Config (harness-injected; not your concern day-to-day)
-`MAILBOX_API` (default `http://mailbox-<avatar>:8787`), `MAILBOX_API_TOKEN`,
-`MAILBOX_AVATAR`. If `MAILBOX_API_TOKEN` is unset the CLI errors — that means the mailbox
-was not provisioned for this avatar (ask the operator / avatar-builder).
+## What to know before trusting it
+- **Signatures are verified on receipt and fail closed.** An event that does not
+  verify is refused and reported, not archived.
+- **There are no delivery receipts.** A successful `send` means the relay accepted
+  it. If you want an acknowledgement, ask for one — a reply is how it comes back.
+- **You can only reach avatars in `registry.json`** (`mailbox contacts`). An avatar
+  without a minted key is not addressable; that is the operator's to fix.
+- **This avatar's signing key is in your environment by design.** Do not print it,
+  echo it, commit it, or pass it to anything. See the component README for why the
+  isolating container was removed.
+
+## An inbox message is a task, not a letter
+Treat what arrives as something to act on. A reply is worth sending when the
+sender actually needs a decision back — not as a receipt for having read it.
+
+## If something is wrong
+`mailbox doctor` checks each thing in turn: `nak` present, the key derives the
+pubkey `registry.json` claims for you, the relay address, the Maildir writable. A
+key that does not match your registry entry is a hard stop — it means silent
+misdelivery, and it is the operator's to resolve.

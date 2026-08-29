@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# mailbox -- avatar-to-avatar messaging over Nostr. No daemon, no container.
+#
+#   mailbox doctor                              check the setup before trusting it
+#   mailbox contacts                            who can I reach (registry.json)
+#   mailbox fetch                               claim new mail from the relay
+#   mailbox list [--all]                        unread (default) or everything
+#   mailbox read <event-id>                     print it; marks it seen
+#   mailbox send <avatar> --subject S <body|->  sign + publish
+#   mailbox reply <event-id> <body|->           threaded reply
+#
+# WHY THERE IS NO DAEMON
+#
+# The relay is the persistence layer: it holds every message until it is claimed.
+# So there is nothing for a long-running process to do -- mail that arrives while
+# nobody is home waits on the relay, which is what store-and-forward is for. This
+# script claims it when the avatar asks. That deletes a Go service, an image, a
+# compose project, two docker networks and a whole class of boot failures.
+#
+# WHERE THE MESSAGES GO
+#
+# A Maildir under $MAILBOX_ROOT (default <avatar>/mail): tmp -> new -> cur for
+# received, .Sent for sent. Messages are RFC 5322, so the archive is readable by
+# anything that reads mail, and it is the ONLY record -- there is no index to
+# rebuild and no state to lose. Dedupe is by Nostr event id, which is in every
+# filename, so re-fetching costs a directory listing and changes nothing.
+#
+# THE KEY
+#
+# $NOSTR_MAILBOX_NSEC is this avatar's signing key, and signing IS identity. It is
+# in this container's environment by DECISION, not by accident: an earlier design
+# kept it in a separate container so the LLM could not read it, but that container
+# signed whatever it was asked to sign, so it never prevented misuse -- only
+# exfiltration of the key itself. On one machine, under one operator who can
+# impersonate any avatar anyway, that was not worth a Go service. Revisit when
+# avatars run on hosts their operator does not own.
+set -euo pipefail
+
+KIND_MESSAGE=3838
+
+: "${MAILBOX_AVATAR:?set MAILBOX_AVATAR to the name this avatar has in registry.json}"
+: "${AVATAR_ROOT:=/project}"
+: "${MAILBOX_ROOT:=$AVATAR_ROOT/mail}"
+: "${MAILBOX_REGISTRY:=$AVATAR_ROOT/tools/nostr-mailbox/registry.json}"
+: "${NOSTR_MAILBOX_RELAY:=ws://nostr-relay:8080}"
+
+die() { printf '\033[1;31mmailbox:\033[0m %s\n' "$*" >&2; exit 1; }
+say() { printf '\033[1;34mmailbox:\033[0m %s\n' "$*"; }
+
+# ─────────────────────────────────────────────────────────────── nak ──────────
+# Every call to nak lives here. It is the one dependency whose interface this
+# script does not control, so `mailbox doctor` probes it rather than assuming --
+# a wrong flag should say so on demand, not halfway through sending.
+
+# Via stdin, not argv, for the same reason as NOSTR_SECRET_KEY below. printf is a
+# bash builtin, so the key never becomes any process's arguments.
+nak_pubkey() { printf %s "$1" | nak key public; }           # sec -> pubkey-hex
+
+
+# nak takes the key from $NOSTR_SECRET_KEY, and that is the form to use: passing it
+# as --sec would put the avatar's private key in the process argv, where anything
+# that can read /proc in this container can see it. Exported only for nak's own
+# children, and it is the same value already in this environment -- no new exposure,
+# one less place it is visible.
+export NOSTR_SECRET_KEY="${NOSTR_MAILBOX_NSEC:-}"
+
+nak_publish() { # <content-file> <to-hex> <subject> [<reply-to-id>]
+    local args=( event -k "$KIND_MESSAGE"
+                 --tag "p=$2" --tag "subject=$3"
+                 --tag "from_name=$MAILBOX_AVATAR" )
+    [[ -n "${4:-}" ]] && args+=( --tag "e=$4;;reply" )
+    nak "${args[@]}" -c "$(cat "$1")" "$NOSTR_MAILBOX_RELAY"
+}
+
+nak_fetch() { # -> one event JSON per line
+    nak req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
+}
+
+nak_verify() { nak verify 2>/dev/null; }                    # event JSON on stdin
+
+# ──────────────────────────────────────────────────────── registry ────────────
+reg_npub() { jq -r --arg n "$1" '.[$n].npub // empty' "$MAILBOX_REGISTRY"; }
+reg_name() { jq -r --arg k "$1" 'to_entries[] | select(.value.pubkey_hex==$k) | .key' \
+                "$MAILBOX_REGISTRY" | head -1; }
+
+[[ -f "$MAILBOX_REGISTRY" ]] || die "no registry.json at $MAILBOX_REGISTRY"
+MY_HEX="$(jq -r --arg n "$MAILBOX_AVATAR" '.[$n].pubkey_hex // empty' "$MAILBOX_REGISTRY")"
+[[ -n "$MY_HEX" ]] || die "$MAILBOX_AVATAR has no entry in $MAILBOX_REGISTRY"
+MY_PUBKEY="$MY_HEX"
+
+# ──────────────────────────────────────────────────────── maildir ─────────────
+INBOX="$MAILBOX_ROOT"
+SENT="$MAILBOX_ROOT/.Sent"
+
+md_init() { mkdir -p "$INBOX"/{tmp,new,cur} "$SENT"/{tmp,new,cur}; }
+
+# A message is already claimed if any file names its event id. The archive is the
+# index; there is nothing else to consult.
+md_has() { find "$MAILBOX_ROOT" -type f -name "*.$1.*" -print -quit 2>/dev/null | grep -q .; }
+
+# Maildir requires the filename to be unique and forbids readers from parsing it.
+# The event id makes it unique for free AND makes dedupe a directory listing.
+md_name() { printf '%s.%s.%s' "$2" "$1" "$MAILBOX_AVATAR"; }   # <event-id> <created_at>
+
+# Deliver: write into tmp/, then rename into new/ or cur/. The rename is atomic on
+# every POSIX filesystem, which is the whole reason Maildir exists -- no locking,
+# and a reader never sees a half-written message.
+md_deliver() { # <folder> <event-id> <created_at> <flags> <new|cur> ; message on stdin
+    local folder="$1" name; name="$(md_name "$2" "$3")"
+    [[ -n "$4" ]] && name="$name:2,$4"
+    cat > "$folder/tmp/$name"
+    mv "$folder/tmp/$name" "$folder/${5:-new}/$name"
+    printf '%s\n' "$folder/${5:-new}/$name"
+}
+
+md_find() { find "$INBOX/new" "$INBOX/cur" -type f -name "*.$1.*" 2>/dev/null | head -1; }
+
+# Seen is a rename, not a database write: new/<name> -> cur/<name>:2,S
+md_mark_seen() {
+    local f="$1" base; base="$(basename "$f")"
+    [[ "$f" == */new/* ]] || return 0
+    mv "$f" "$INBOX/cur/${base}:2,S"
+}
+
+# ────────────────────────────────────────────────────── rfc 5322 ──────────────
+# The envelope is real mail headers, so the archive is readable by anything that
+# reads mail and the Nostr specifics ride along as X- headers. Threading is free:
+# a Nostr "e" tag IS In-Reply-To.
+render() { # event JSON on stdin -> RFC 5322 on stdout
+    local ev; ev="$(cat)"
+    local id created content subject from_hex from_name reply_to to_name
+    id=$(jq -r '.id' <<<"$ev")
+    created=$(jq -r '.created_at' <<<"$ev")
+    from_hex=$(jq -r '.pubkey' <<<"$ev")
+    content=$(jq -r '.content' <<<"$ev")
+    subject=$(jq -r '(.tags[] | select(.[0]=="subject") | .[1]) // ""' <<<"$ev" | head -1)
+    from_name=$(jq -r '(.tags[] | select(.[0]=="from_name") | .[1]) // ""' <<<"$ev" | head -1)
+    reply_to=$(jq -r '(.tags[] | select(.[0]=="e") | .[1]) // ""' <<<"$ev" | head -1)
+    to_name="$MAILBOX_AVATAR"
+    [[ -n "$from_name" ]] || from_name="$(reg_name "$from_hex")"
+    [[ -n "$from_name" ]] || from_name="unknown"
+
+    printf 'Message-ID: <%s@nostr>\n' "$id"
+    printf 'Date: %s\n' "$(date -u -R -d "@$created")"
+    printf 'From: %s <%s@nostr>\n' "$from_name" "$(reg_npub "$from_name" || echo "$from_hex")"
+    printf 'To: %s <%s@nostr>\n' "$to_name" "$(reg_npub "$to_name")"
+    printf 'Subject: %s\n' "$subject"
+    [[ -n "$reply_to" ]] && printf 'In-Reply-To: <%s@nostr>\n' "$reply_to"
+    printf 'X-Nostr-Event-Id: %s\n' "$id"
+    printf 'X-Nostr-Pubkey: %s\n' "$from_hex"
+    printf 'X-Nostr-Kind: %s\n' "$(jq -r '.kind' <<<"$ev")"
+    printf 'X-Nostr-Sig: %s\n' "$(jq -r '.sig' <<<"$ev")"
+    printf 'MIME-Version: 1.0\n'
+    printf 'Content-Type: text/markdown; charset=utf-8\n'
+    printf '\n%s\n' "$content"
+}
+
+hdr() { sed -n "/^$2:/{s/^$2:[[:space:]]*//;p;q}" "$1"; }
+
+# ───────────────────────────────────────────────────────── commands ───────────
+read_body() { [[ "${1:-}" == "-" ]] && cat || printf '%s' "$1"; }
+
+cmd_doctor() {
+    local ok=0
+    command -v nak >/dev/null && say "nak: $(nak --version 2>&1 | head -1)" \
+        || { printf '  MISSING: nak is not installed (add it to the harness image)\n'; ok=1; }
+    command -v jq >/dev/null || { printf '  MISSING: jq\n'; ok=1; }
+    if [[ -z "${NOSTR_MAILBOX_NSEC:-}" ]]; then
+        printf '  MISSING: NOSTR_MAILBOX_NSEC is not in the environment\n'; ok=1
+    elif command -v nak >/dev/null; then
+        # The assertion the old container made at startup: the key you were given
+        # must be the identity you claim. A mismatch is silent misdelivery.
+        local derived; derived="$(nak_pubkey "$NOSTR_MAILBOX_NSEC" 2>/dev/null || true)"
+        if [[ "$derived" == "$MY_HEX" ]]; then
+            say "key: derives $MY_HEX -- matches registry entry for $MAILBOX_AVATAR"
+        else
+            printf '  WRONG KEY: derives %s, registry says %s\n' "${derived:-<nak failed>}" "$MY_HEX"; ok=1
+        fi
+    fi
+    say "relay:    $NOSTR_MAILBOX_RELAY"
+    say "maildir:  $MAILBOX_ROOT"
+    say "contacts: $(jq -r 'keys | length' "$MAILBOX_REGISTRY") in $MAILBOX_REGISTRY"
+    md_init && say "maildir is writable"
+    return $ok
+}
+
+cmd_contacts() { jq -r 'to_entries[] | "  \(.key)  \(.value.npub)"' "$MAILBOX_REGISTRY"; }
+
+cmd_fetch() {
+    md_init
+    local n=0 dup=0 bad=0 ev id created
+    while IFS= read -r ev; do
+        [[ -n "$ev" ]] || continue
+        id=$(jq -r '.id // empty' <<<"$ev"); [[ -n "$id" ]] || continue
+        if md_has "$id"; then dup=$((dup+1)); continue; fi
+        # Fail closed. An event that does not verify is not archived -- the relay's
+        # allowlist is not a substitute for checking the signature ourselves.
+        if ! printf '%s' "$ev" | nak_verify; then
+            bad=$((bad+1)); printf '  REJECTED %s: signature does not verify\n' "${id:0:8}" >&2; continue
+        fi
+        created=$(jq -r '.created_at' <<<"$ev")
+        printf '%s' "$ev" | render | md_deliver "$INBOX" "$id" "$created" "" new >/dev/null
+        n=$((n+1))
+    done < <(nak_fetch)
+    say "claimed $n new, skipped $dup already held$( ((bad)) && printf ', REJECTED %d unverified' "$bad")"
+}
+
+cmd_list() {
+    local dirs=("$INBOX/new")
+    [[ "${1:-}" == "--all" ]] && dirs+=("$INBOX/cur" "$SENT/cur")
+    local f
+    find "${dirs[@]}" -type f 2>/dev/null | sort -r | while read -r f; do
+        printf '  %-10s %-28s %s\n' \
+            "$([[ "$f" == */new/* ]] && echo unread || echo seen)" \
+            "$(hdr "$f" From | cut -d' ' -f1)" \
+            "$(hdr "$f" Subject)"
+        printf '  %-10s %s\n' '' "$(hdr "$f" X-Nostr-Event-Id)"
+    done
+}
+
+cmd_read() {
+    local f; f="$(md_find "${1:?usage: mailbox read <event-id>}")"
+    [[ -n "$f" ]] || die "no message with id ${1}"
+    cat "$f"
+    md_mark_seen "$f"
+}
+
+cmd_send() {
+    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S <body|->"
+    local to="$1"; shift
+    local subject="" reply=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --subject) subject="$2"; shift 2 ;;
+            --reply)   reply="$2"; shift 2 ;;
+            *)         break ;;
+        esac
+    done
+    local to_hex
+    to_hex="$(jq -r --arg n "$to" '.[$n].pubkey_hex // empty' "$MAILBOX_REGISTRY")"
+    [[ -n "$to_hex" ]] || die "unknown recipient $to -- not in the registry; try: mailbox contacts"
+    md_init
+    local body ev rc=0
+    body="$(mktemp)"
+    read_body "${1:-}" > "$body"
+    ev="$(nak_publish "$body" "$to_hex" "$subject" "$reply")" || rc=$?
+    rm -f "$body"
+    (( rc == 0 )) || die "publish failed -- nothing was sent and nothing was archived"
+    local id created; id=$(jq -r '.id' <<<"$ev"); created=$(jq -r '.created_at' <<<"$ev")
+    printf '%s' "$ev" | render | md_deliver "$SENT" "$id" "$created" "S" cur >/dev/null
+    say "sent to $to  ($id)"
+}
+
+cmd_reply() {
+    local f; f="$(md_find "${1:?usage: mailbox reply <event-id> <body|->}")"
+    [[ -n "$f" ]] || die "no message with id ${1}"
+    local parent peer subject
+    parent="$(hdr "$f" X-Nostr-Event-Id)"
+    peer="$(hdr "$f" From | cut -d' ' -f1)"
+    subject="$(hdr "$f" Subject)"
+    [[ "$subject" == Re:* ]] || subject="Re: $subject"
+    shift
+    cmd_send "$peer" --subject "$subject" --reply "$parent" "${1:--}"
+    # Replied is a Maildir flag, so the archive records it without a database.
+    # Flags are stripped from the BASENAME -- a path may legitimately contain a colon.
+    local base; base="$(basename "$f")"
+    mv "$f" "$INBOX/cur/${base%%:*}:2,SR"
+}
+
+case "${1:-doctor}" in
+    doctor)   shift; cmd_doctor "$@" ;;
+    contacts) shift; cmd_contacts "$@" ;;
+    fetch)    shift; cmd_fetch "$@" ;;
+    list)     shift; cmd_list "$@" ;;
+    read)     shift; cmd_read "$@" ;;
+    send)     shift; cmd_send "$@" ;;
+    reply)    shift; cmd_reply "$@" ;;
+    -h|--help|help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$1' (doctor|contacts|fetch|list|read|send|reply)" ;;
+esac

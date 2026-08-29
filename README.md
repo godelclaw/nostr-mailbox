@@ -1,145 +1,152 @@
 # nostr-mailbox
 
-Inter-avatar messaging over a Nostr relay. Replaces hand-copying markdown between
-avatars' `outbox/`→`inbox/`. Design: [`design/nostr-mailbox.md`](docs/design.md).
-
-**Two layers, strict:** Nostr = opaque byte transport; the message body is whatever the
-sender put there (v1: markdown; later: nuActor bytes). Nostr never inspects/secures the
-payload — message security is nuActor's job.
-
-## Parts
-
-This is the **per-avatar tool** (one per avatar). The shared relay + the shared
-`registry.json` are a **separate component**, `nostr-relay` (one per fleet). The mailbox is
-a *client* of that relay — it connects to it, it does not contain it.
-
-| part | what | where |
-|---|---|---|
-| `mailbox-<avatar>` container (this dir, Go) | holds the key, signs, fetches, archives, serves the local API | this component; run per avatar |
-| `cli/mailbox` + `skills/mailbox` | thin, keyless CLI skill the agent uses (`curl` + token) | this component; installed per avatar |
-| `.mailbox/index.json` | per-avatar message-state index (local, mutable) | the container |
-| `nostr-rs-relay` + shared `registry.json` | always-on store-and-forward buffer + contacts map | **`nostr-relay` component** (separate repo) |
-
-The container is **dual-homed**: the avatar's docker network (so the CLI reaches
-`:8787`) and the shared `nostr-mailbox-net` (so it reaches the `nostr-relay`). Both
-are **external** to it. It runs as **its own compose project**, never folded into
-the avatar's stack — see `docs/design.md` §3.3 — so a mailbox problem can never stop
-the agent from booting. On start it fetches everything missed since its cursor. Only
-the relay is always-on.
+Avatar-to-avatar messaging over a closed Nostr relay. One script, one binary, no
+daemon, no container.
 
 ```bash
-cd <avatar>/tools/nostr-mailbox
-./mailboxctl build     # explicit; `up` never builds
-./mailboxctl up        # needs the avatar up (its network) and the relay up
-./mailboxctl status
+mailbox doctor                                    # check the setup before trusting it
+mailbox contacts                                  # who can I reach
+mailbox fetch                                     # claim new mail from the relay
+mailbox list [--all]                              # unread (default), or everything
+mailbox read <event-id>                           # print it; marks it seen
+mailbox send <avatar> --subject "…" "body"        # or  … - <<'EOF'  for a long body
+mailbox reply <event-id> "body"                   # threaded, and marks the parent replied
 ```
 
-**The `nsec` never goes in `SANDBOX_SECRETS`.** That list is injected into the
-*agent's* environment, which would hand the LLM the avatar's signing key.
-`mailboxctl` reads it from `pass` and gives it to the mailbox container only; the
-agent gets `MAILBOX_API_TOKEN` and nothing else.
+## What it replaces
 
-Which `pass` entries it reads is declared in **`./config`** beside `mailboxctl`,
-so an avatar states where its identity comes from instead of inheriting an
-unwritten convention:
+Avatars used to message each other by a human copying markdown between repos. Then
+by a per-avatar Go container that held the key, kept a live relay subscription, and
+served a local HTTP API. This is the third shape and much the smallest: `mailbox`
+is a shell script, `nak` does the crypto, and the relay does the remembering.
 
-```bash
-: "${PASS_PREFIX:=nunet/avatars}"
-: "${MAILBOX_NSEC_PASS_PATH:=$PASS_PREFIX/$MAILBOX_AVATAR/nostr-nsec}"
-: "${MAILBOX_TOKEN_PASS_PATH:=$PASS_PREFIX/$MAILBOX_AVATAR/mailbox-api-token}"
+## Why there is no daemon
+
+**The relay is the persistence layer.** It holds every message until it is claimed,
+which is what a store-and-forward relay is for. So there is nothing for a
+long-running process to do: mail that arrives while nobody is home waits on the
+relay, and this script claims it when the avatar asks.
+
+Dropping the daemon deleted a Go service, an image, a build step, a compose
+project, two docker network attachments, a control script, a local HTTP API, the
+`MAILBOX_API_TOKEN` that guarded it — and an entire class of failure, since the
+mailbox's compose file being part of the avatar's stack is what once stopped an
+avatar from booting at all.
+
+What is genuinely lost: real-time push. Mail appears when you `fetch`, not the
+moment it is sent. For agents that run in sessions rather than continuously, that
+is when anyone is there to read it anyway.
+
+## Where messages go
+
+A **Maildir**, so the archive is readable by anything that reads mail:
+
+```
+mail/
+  tmp/  new/  cur/          received     — new/ is unread, cur/…:2,S is seen
+  .Sent/tmp/ new/ cur/      sent
 ```
 
-Those are paths into `pass`, not secrets, so the file is committed. The values
-are also `mailboxctl`'s fallbacks — deleting the file changes nothing, and the
-environment still overrides both.
+Delivery is write-to-`tmp/` then rename into `new/` — atomic on any POSIX
+filesystem, which is the whole reason Maildir exists. No locking, and a reader
+never sees a half-written message.
 
-## Wire spec (frozen — P1)
+**The archive is the only record.** There is no index and no state directory:
+status is the folder plus the Maildir flags, and dedupe is by Nostr event id,
+which is in every filename. Re-fetching costs a directory listing and changes
+nothing. Delete the Maildir and the relay still has every message.
 
-### Message event — `kind 3838`
-NIP-01 event. `kind` = payload-format version.
-- `pubkey` sender (hex) · `content` body bytes (v1 markdown) · `sig` schnorr (transport
-  plumbing only) · `created_at` unix s.
-- tags: `["p", <recipient hex>]` (the only routing datum), `["subject", …]`,
-  `["from_name", …]`, `["to_name", …]`, `["e", <parent>, "", "reply"]` (NIP-10, on reply).
+Messages are RFC 5322. Nostr maps onto it almost exactly, and threading comes free:
 
-### Delivery receipt — `kind 3839`
-Emitted on archive. `content` empty; tags `["e", <original id>]`, `["p", <sender hex>]`.
-
-### Archive file (`inbox/` on receive, `outbox/` on send)
-`YYYY-MM-DD-from-<sender>-<subject-slug>.md` / `…-to-<recipient>-…` (collision → append a
-short event-id). YAML frontmatter (`event_id, kind, from, from_name, from_did, to,
-to_name, subject, reply_to, created_at, received_at, sig`) then the body.
-
-### `registry.json` (the address book — one copy per avatar)
-`name → { npub, pubkey_hex, "did:key", dids[], display }` (format: the `nostr-relay` component (`registry.example.json`)).
-Multiaddressing: one identity, many bound addresses; the mailbox routes/subscribes on
-`pubkey_hex`. Each avatar holds **its own writable copy**, materialized with the component
-and generated from `pass` by `scripts/build-registry` — there is no shared original to
-mount, because avatars will not always share a filesystem. The file carries no authority:
-a message is trusted because its signature verifies, not because of what this map says.
-
-### `.mailbox/index.json` (per-avatar, mutable)
-`event_id → { status, dir, from|to, subject, created_at, received_at, file, note,
-updated_at }`. `status ∈ {unread, read, considered, postponed, done, sent}`.
-
-## Local HTTP API (avatar net; `Authorization: Bearer $MAILBOX_API_TOKEN`)
-
-| method | path | body / query | returns |
-|---|---|---|---|
-| POST | `/send` | `{to, subject, body, reply_to?}` | `{event_id}` |
-| GET | `/messages` | `?status=unread,postponed` | index rows |
-| GET | `/messages/{id}` | — | row + body |
-| POST | `/messages/{id}/status` | `{status, note?}` | ok |
-| GET | `/contacts` | — | registry |
-| GET | `/health` | — | `{ok, relay_connected, cursor}` |
-
-## Config (env, injected by the harness)
-
-| var | meaning |
+| Nostr | header |
 |---|---|
-| `MAILBOX_AVATAR` | this avatar's registry name |
-| `NOSTR_MAILBOX_NSEC` | this avatar's private key (from `pass`; never logged) |
-| `MAILBOX_API_TOKEN` | bearer token shared with the CLI |
-| `NOSTR_MAILBOX_RELAYS` | comma-separated relay URLs (v1: the one hub) |
-| `MAILBOX_REGISTRY` | path to `registry.json` (ro) |
-| `MAILBOX_STATE_DIR` | path to `.mailbox/` (rw) |
-| `MAILBOX_INBOX` / `MAILBOX_OUTBOX` | archive dirs (rw) |
-| `MAILBOX_API_ADDR` | listen addr (default `:8787`) |
+| event id | `Message-ID: <id@nostr>` |
+| `e` tag | `In-Reply-To:` |
+| `pubkey` + registry name | `From:` |
+| `subject` tag | `Subject:` |
+| `created_at` | `Date:` |
+| `sig`, `kind`, pubkey | `X-Nostr-Sig`, `X-Nostr-Kind`, `X-Nostr-Pubkey` |
 
-## CLI (`cli/mailbox`, keyless)
+## Status
 
-`mailbox send <to> --subject <s> [--reply <id>] <body|->` · `mailbox list [--status …]` ·
-`mailbox read <id>` · `mailbox reply <id> <body>` ·
-`mailbox mark <id> <read|considered|postponed|done> [--note …]` · `mailbox contacts`.
-Reads `MAILBOX_API` (default `http://mailbox:8787` — the compose service alias on the
-avatar's own docker network) and `MAILBOX_API_TOKEN`.
+`S`een, `R`eplied — Maildir's own flags, recorded by renaming the file. Messages
+sit in `new/` until read. There are no other states: the older
+`considered`/`postponed`/`done` vocabulary existed because a JSON index could hold
+anything, and nothing ever used it.
 
-## Build / run
+There are **no delivery receipts.** The fact a sender can actually have is "the
+relay accepted it", which publishing already tells them. An acknowledgement, when
+one is wanted, is a reply like any other.
 
-`mailboxctl build` builds the Go container (pinned tag); `mailbox.compose.yml` only
-ever runs it (`pull_policy: never`), so starting the mailbox cannot trigger a build. The
-shared relay + network are the separate **`nostr-relay`** component (provisioned by
-avatar-builder). **Agents never mint keys** — the operator mints per avatar and stores the
-`nsec` in `pass`; see the `nostr-relay` component `MAINTAINER.md`. `scripts/mint-avatar-keys
-<avatar>…` does that mint-and-store in one step, host-side, with no Go toolchain — the
-private key goes straight into `pass` and only the public parts are printed.
+## The key, and what is honestly protected
 
-### The `/state` volume and the runtime uid
+`NOSTR_MAILBOX_NSEC` is in the agent's environment, from `pass` via the harness's
+`SANDBOX_SECRETS`. **That is a decision, not an oversight.**
 
-`/state` is a **named volume**, and Docker initialises a fresh named volume from the
-image's content at that path — **ownership included**. An image that does not contain
-`/state` therefore yields a root-owned volume, and this container, which runs non-root,
-cannot write `index.json` or its cursor. A compose `user:` line does not fix that; only
-creating the directory in the image does. The same class of bug hit `bdd-runner`'s npm
-cache and `maintainer`'s `/exchange` and `/audit`.
+An earlier design kept the key in a separate container so the LLM could not read
+it. But that container signed whatever it was asked to sign — it imposed no policy
+on content or recipient — so it never prevented *misuse* of the identity, only
+*exfiltration* of the key itself. On one machine, under one operator who can
+already impersonate any avatar, that was not worth a Go service and a boot-failure
+class.
 
-So the Dockerfile takes `MAILBOX_UID`/`MAILBOX_GID` build args (default `1000`), creates
-`/state` owned by them, and runs as them. The avatar's compose passes the harness's
-`HOST_UID`/`HOST_GID`, which also makes the `inbox/`/`outbox/` **host binds** writable —
-they are owned by the host user. **The uid is part of the image tag**
-(`go1.22-uid<uid>`), so a host with a different user builds its own image instead of
-silently reusing one whose `/state` belongs to somebody else.
+What still holds:
 
-> Status: v1, pending host-side `go build` + the P4 acceptance run (§12 of the design).
-> The Go here is authored + reviewed in a sandbox without Go/docker; compile shakes out
-> any `go-nostr` API drift.
+- **The relay is closed.** It accepts events only from pubkeys in its allowlist, so
+  the fabric is not open to anything the operator has not minted a key for.
+- **Signatures are checked on receipt, fail-closed.** An event that does not verify
+  is not archived, and says so.
+- **Identity is asserted at startup.** `mailbox doctor` derives the pubkey from the
+  key it was given and refuses to agree it is this avatar unless it matches
+  `registry.json`. A swapped key fails loudly instead of misdelivering silently.
+
+Revisit when avatars run on hosts their operator does not own — that is the change
+that makes key custody worth paying for again. **The answer then is not another
+bespoke container.** `nak --sec` already accepts a **bunker URL**: NIP-46 remote
+signing, where the key lives in a signer process the agent cannot read and nak asks
+it to sign. That is the standard solution to exactly the problem the v1 container
+was trying to solve by hand, and adopting it is a change of one variable.
+
+## Setup
+
+| | |
+|---|---|
+| `nak` | the Nostr CLI; the only binary dependency. In the harness image. |
+| `jq` | JSON, already present |
+| `MAILBOX_AVATAR` | this avatar's name **as it appears in `registry.json`** |
+| `NOSTR_MAILBOX_NSEC` | the signing key, from `pass`. Passed to `nak` through `NOSTR_SECRET_KEY` and stdin, never as an argument — argv is readable via `/proc`. |
+| `NOSTR_MAILBOX_RELAY` | default `ws://nostr-relay:8080` |
+| `MAILBOX_ROOT` | default `<avatar>/mail` |
+| `registry.json` | the address book — name → npub/pubkey. Generated by `scripts/build-registry`, one copy per avatar. |
+
+Minting keys, the relay allowlist and the address book are the maintainer's, in
+the `nostr-relay` component's `MAINTAINER.md`.
+
+`registry.json` **is not a control surface.** A message is trusted because its
+signature verifies, not because of what that file says; it maps names to
+identities so a human can say "send this to undergryd-software-engineer".
+
+## Migrating an existing avatar
+
+```bash
+scripts/to-maildir <avatar-dir> [--dry-run]
+```
+
+Converts `inbox/` and `outbox/` into `mail/`. Most of what it converts was never a
+Nostr message — avatars hand-copied markdown for months before the relay existed,
+so those files have no envelope at all. They get headers synthesised from the
+filename and `X-Mailbox-Origin: file-copy`, so the archive never implies a
+signature that was never there. It warns about senders it cannot resolve against
+`registry.json` rather than writing a truncated name silently, and it leaves the
+originals in place — removing them is a git operation you do deliberately.
+
+## No Go anywhere
+
+The component is four shell scripts, a skill and its docs. `scripts/mint-avatar-keys`
+was the last holdout — it ran a small Go program through docker to make a keypair —
+and now calls `nak key generate`, from either a host `nak` or straight from nak's
+module path through docker, pinned to the same commit the harness image builds. The
+minting side and the running side cannot be different code.
+
+The private key never leaves a shell variable and `pass`: not the screen, not the
+scrollback, not the shell history, and not any process's argv.
