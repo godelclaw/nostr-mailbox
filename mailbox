@@ -52,10 +52,20 @@ say() { printf '\033[1;34mmailbox:\033[0m %s\n' "$*"; }
 # script does not control, so `mailbox doctor` probes it rather than assuming --
 # a wrong flag should say so on demand, not halfway through sending.
 
-nak_pubkey() { nak key public "$1"; }                       # sec-hex -> pubkey-hex
+# Via stdin, not argv, for the same reason as NOSTR_SECRET_KEY below. printf is a
+# bash builtin, so the key never becomes any process's arguments.
+nak_pubkey() { printf %s "$1" | nak key public; }           # sec -> pubkey-hex
+
+
+# nak takes the key from $NOSTR_SECRET_KEY, and that is the form to use: passing it
+# as --sec would put the avatar's private key in the process argv, where anything
+# that can read /proc in this container can see it. Exported only for nak's own
+# children, and it is the same value already in this environment -- no new exposure,
+# one less place it is visible.
+export NOSTR_SECRET_KEY="${NOSTR_MAILBOX_NSEC:-}"
 
 nak_publish() { # <content-file> <to-hex> <subject> [<reply-to-id>]
-    local args=( event --sec "$NOSTR_MAILBOX_NSEC" -k "$KIND_MESSAGE"
+    local args=( event -k "$KIND_MESSAGE"
                  --tag "p=$2" --tag "subject=$3"
                  --tag "from_name=$MAILBOX_AVATAR" )
     [[ -n "${4:-}" ]] && args+=( --tag "e=$4;;reply" )
