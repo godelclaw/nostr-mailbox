@@ -122,6 +122,17 @@ md_mark_seen() {
     mv "$f" "$INBOX/cur/${base}:2,S"
 }
 
+# Replied is a Maildir flag, recorded by renaming -- no database. Idempotent:
+# replying twice must not mv the file onto itself. Flags are stripped from the
+# BASENAME (a path may legitimately contain a colon), then :2,SR reapplied.
+md_mark_replied() {
+    local f="$1" base target; base="$(basename "$f")"
+    target="$INBOX/cur/${base%%:*}:2,SR"
+    # -ef (same device+inode), not string ==, so the guard holds even if the
+    # caller passes a path spelled differently for the same file.
+    [[ "$f" -ef "$target" ]] || mv "$f" "$target"
+}
+
 # ────────────────────────────────────────────────────── rfc 5322 ──────────────
 # The envelope is real mail headers, so the archive is readable by anything that
 # reads mail and the Nostr specifics ride along as X- headers. Threading is free:
@@ -280,11 +291,11 @@ cmd_reply() {
     [[ "$subject" == Re:* ]] || subject="Re: $subject"
     shift
     cmd_send "$peer" --subject "$subject" --reply "$parent" "$@"
-    # Replied is a Maildir flag, so the archive records it without a database.
-    # Flags are stripped from the BASENAME -- a path may legitimately contain a colon.
-    local base; base="$(basename "$f")"
-    mv "$f" "$INBOX/cur/${base%%:*}:2,SR"
+    md_mark_replied "$f"
 }
+
+# When sourced (e.g. by tests) define the functions but do not dispatch.
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] || return 0
 
 case "${1:-doctor}" in
     doctor)   shift; cmd_doctor "$@" ;;
