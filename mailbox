@@ -279,7 +279,7 @@ cmd_send() {
         [[ $# -eq 1 ]] || die "inline body must be a single quoted argument (or use --body-file F)"
         body="$1"
     else
-        die "no body -- pass an inline body or --body-file F (write long bodies to /project/tmp/…)"
+        die "no body -- pass an inline body or --body-file F (for a long body: mkdir -p /project/tmp first -- nothing creates it, and it is gitignored)"
     fi
     require_body "$body"
     local to_hex
