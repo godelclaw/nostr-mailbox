@@ -29,7 +29,14 @@ set -euo pipefail
 
 PASS_PREFIX="${PASS_PREFIX:-nunet/avatars}"
 NAK_COMMIT="${NAK_COMMIT:-fb21939f45538eff414068fa1bb6f1bea705f447}"   # v0.20.6
-GO_IMAGE="${GO_IMAGE:-golang:1.25-alpine}"
+# bookworm, NOT alpine: nak needs cgo. Its lmdb.go is gated
+# `//go:build linux && !riscv64 && !arm64`, so on linux/amd64 it always compiles in
+# PowerDNS/lmdb-go, which has no non-cgo files at all. The alpine image ships no C
+# toolchain, so Go silently disables cgo and the build dies with "build constraints
+# exclude all Go files in .../lmdb-go/lmdb". bookworm ships gcc and libc6-dev, which
+# is also why the harness image builds nak on it -- and this script exists to keep
+# the minting side and the running side on the same code, so it uses the same base.
+GO_IMAGE="${GO_IMAGE:-golang:1.25-bookworm}"
 
 [ $# -gt 0 ] || { echo "usage: $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
 
