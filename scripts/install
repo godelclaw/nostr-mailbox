@@ -39,13 +39,22 @@ fi
 # The symlink is resolved INSIDE the container, so it must point at the container
 # path (/project/...), never at wherever this repo happens to sit on the host.
 #
-# Iterate the HARNESSES, not existing .local/bin directories. Keying off the
-# directory meant a harness that had never had one was skipped in silence --
-# claude only qualified because claude itself installs there -- so `mailbox`
-# was never linked for opencode, and the agent had to invoke it by full path.
-# A harness is anything with a home/ (harness/core has none, and is not one).
+# Iterate the HARNESSES, not directories that happen to exist already. This has
+# now been the same bug twice, at two different levels:
+#
+#   1. Keying off .local/bin meant a harness that had never had one was skipped
+#      in silence -- claude only qualified because claude itself installs there
+#      -- so `mailbox` was never linked for opencode.
+#   2. Keying off home/ has the same shape: home/ only appears once a harness
+#      has been STARTED, so an avatar with a harness that is installed but never
+#      launched links one harness and passes over the other, again in silence.
+#      Found on a live avatar whose opencode harness had never run.
+#
+# So the test is entrypoint.sh, which exists from the moment the harness is
+# synced and does not depend on anything having run. It still correctly excludes
+# harness/core and harness/config, which are not harnesses.
 for h in "$AV"/harness/*; do
-    [[ -d "$h/home" ]] || continue
+    [[ -f "$h/entrypoint.sh" ]] || continue
     run mkdir -p "$h/home/.local/bin"
     run ln -sfn /project/tools/nostr-mailbox/mailbox "$h/home/.local/bin/mailbox"
     echo "  linked $(basename "$h"):  mailbox"
