@@ -152,7 +152,7 @@ md_mark_replied() {
 # a Nostr "e" tag IS In-Reply-To.
 render() { # event JSON on stdin -> RFC 5322 on stdout
     local ev; ev="$(cat)"
-    local id created content subject from_hex from_name reply_to to_name
+    local id created content subject from_hex from_name reply_to to_hex to_name
     id=$(jq -r '.id' <<<"$ev")
     created=$(jq -r '.created_at' <<<"$ev")
     from_hex=$(jq -r '.pubkey' <<<"$ev")
@@ -160,7 +160,11 @@ render() { # event JSON on stdin -> RFC 5322 on stdout
     subject=$(jq -r '(.tags[] | select(.[0]=="subject") | .[1]) // ""' <<<"$ev" | head -1)
     from_name=$(jq -r '(.tags[] | select(.[0]=="from_name") | .[1]) // ""' <<<"$ev" | head -1)
     reply_to=$(jq -r '(.tags[] | select(.[0]=="e") | .[1]) // ""' <<<"$ev" | head -1)
-    to_name="$MAILBOX_AVATAR"
+    # The recipient is the "p" tag, not necessarily us: render() archives our own
+    # outgoing mail too, and there the addressee is the other avatar.
+    to_hex=$(jq -r '(.tags[] | select(.[0]=="p") | .[1]) // ""' <<<"$ev" | head -1)
+    to_name="$(reg_name "$to_hex")"
+    [[ -n "$to_name" ]] || to_name="$MAILBOX_AVATAR"
     [[ -n "$from_name" ]] || from_name="$(reg_name "$from_hex")"
     [[ -n "$from_name" ]] || from_name="unknown"
 
