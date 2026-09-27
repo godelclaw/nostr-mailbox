@@ -387,7 +387,12 @@ cmd_delete() {
     f="$(find "$SENT/cur" -type f -name "*.$id.*" 2>/dev/null | head -1)"
     [[ -n "$f" ]] || die "no sent message with id $id -- you can only unsend mail you sent (mailbox list --all)"
     nak_delete "$id" >/dev/null || die "the deletion request did not publish -- nothing changed"
-    if [[ -n "$(nak_get "$id" 2>/dev/null)" ]]; then
+    # An empty answer means gone only if the query itself succeeded: a relay that
+    # could not be asked also answers with nothing, and must not read as success.
+    local served
+    served="$(nak_get "$id" 2>/dev/null)" \
+        || die "deletion requested, but the relay could not be asked whether it still serves $id -- unconfirmed; rerun mailbox delete"
+    if [[ -n "$served" ]]; then
         die "deletion requested, but the relay STILL SERVES $id -- it has not honoured NIP-09"
     fi
     # Maildir's T flag: trashed. The archive keeps the copy and records the unsend.

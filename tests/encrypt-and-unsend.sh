@@ -101,7 +101,9 @@ is "the subject" "$(hdr "$f" Subject)" "a registered, decryptable message is arc
 DELETED=()
 nak_delete() { DELETED+=("$1"); echo '{}'; }
 STILL_SERVED=no
-nak_get() { [[ "$STILL_SERVED" == yes ]] && echo '{"id":"x"}' || true; }
+nak_get() {
+    case "$STILL_SERVED" in yes) echo '{"id":"x"}' ;; unreachable) return 1 ;; esac
+}
 
 sent_copy() { # <id> -> path of a fake sent archive entry
     local p="$SENT/cur/1788400000.$1.tester:2,S"; : > "$p"; printf '%s' "$p"
@@ -113,6 +115,12 @@ is 1 "$(( rc != 0 ))" "mail we did not send cannot be unsent"
 p="$(sent_copy aaaa)"; STILL_SERVED=yes
 rc=0; ( cmd_delete aaaa ) >/dev/null 2>&1 || rc=$?
 is 1 "$(( rc != 0 ))" "a relay that ignores NIP-09 is reported as a failure"
+[[ -f "$p" ]] && is 1 1 "and the sent copy is not marked unsent" || is 1 0 "and the sent copy is not marked unsent"
+
+# A query that fails also returns nothing; it must not be read as "deleted".
+p="$(sent_copy cccc)"; STILL_SERVED=unreachable
+rc=0; ( cmd_delete cccc ) >/dev/null 2>&1 || rc=$?
+is 1 "$(( rc != 0 ))" "a relay that cannot be asked is not taken as a successful unsend"
 [[ -f "$p" ]] && is 1 1 "and the sent copy is not marked unsent" || is 1 0 "and the sent copy is not marked unsent"
 
 p="$(sent_copy bbbb)"; STILL_SERVED=no
