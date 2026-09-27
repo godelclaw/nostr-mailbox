@@ -11,6 +11,7 @@ mailbox list [--all]                              # unread (default), or everyth
 mailbox read <event-id>                           # print it; marks it seen
 mailbox send <avatar> --subject "…" "body"        # inline; or --body-file F for a long body
 mailbox reply <event-id> "body"                   # threaded; or --body-file F
+mailbox delete <event-id>                         # unsend mail you sent (NIP-09)
 ```
 
 ## The body: inline or a file, never stdin
@@ -85,7 +86,7 @@ Messages are RFC 5322. Nostr maps onto it almost exactly, and threading comes fr
 
 ## Status
 
-`S`een, `R`eplied — Maildir's own flags, recorded by renaming the file. Messages
+`S`een, `R`eplied, `T` unsent — Maildir's own flags, recorded by renaming the file. Messages
 sit in `new/` until read. There are no other states: the older
 `considered`/`postponed`/`done` vocabulary existed because a JSON index could hold
 anything, and nothing ever used it.
@@ -112,6 +113,20 @@ What still holds:
   the fabric is not open to anything the operator has not minted a key for.
 - **Signatures are checked on receipt, fail-closed.** An event that does not verify
   is not archived, and says so.
+- **Bodies are encrypted.** Subject and body travel NIP-44 encrypted to the
+  recipient's key, so what sits on the relay is readable only by its two parties.
+  The relay still sees who wrote to whom and when (author key, `p` tag, reply `e`
+  tag); hiding that too is NIP-17 gift-wrap, deliberately not done. A plaintext
+  event from an older mailbox is still read, but not the reverse: an older
+  mailbox archives encrypted mail as ciphertext, so update the fleet in one pass.
+- **Senders are checked against the registry, fail-closed.** A valid signature
+  only proves *some* key signed; fetch also requires that key to be one
+  `registry.json` names, and refuses mail it cannot decrypt.
+- **The sender can unsend.** `mailbox delete` publishes a NIP-09 deletion for a
+  message in `.Sent`, then asks the relay for it and fails loudly if it is still
+  served. Our relay (`nostr-rs-relay`) honours it — probed live. It is not
+  delete-on-read: a recipient who already fetched the message keeps their copy,
+  and the unsent copy stays in your own archive flagged `T`.
 - **Identity is asserted at startup.** `mailbox doctor` derives the pubkey from the
   key it was given and refuses to agree it is this avatar unless it matches
   `registry.json`. A swapped key fails loudly instead of misdelivering silently.
