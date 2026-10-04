@@ -57,6 +57,13 @@ fi
 : "${MAILBOX_REGISTRY:=$AVATAR_ROOT/tools/nostr-mailbox/registry.json}"
 : "${NOSTR_MAILBOX_RELAY:=ws://nostr-relay:8080}"
 
+# Every call that touches the relay is bounded by this, because nak has no timeout
+# of its own: a relay that accepts the connection and then says nothing leaves
+# `nak req` waiting for an EOSE that never comes, and `nak event` waiting for an OK.
+# Twenty seconds is far longer than a local relay needs and short enough that a
+# wedged call is a message rather than a hung session.
+: "${MAILBOX_RELAY_TIMEOUT:=20}"
+
 die() { printf '\033[1;31mmailbox:\033[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\033[1;34mmailbox:\033[0m %s\n' "$*"; }
 
@@ -77,16 +84,27 @@ nak_pubkey() { printf %s "$1" | nak key public; }           # sec -> pubkey-hex
 # one less place it is visible.
 export NOSTR_SECRET_KEY="${NOSTR_MAILBOX_NSEC:-}"
 
+# SIGINT rather than SIGTERM so nak closes the websocket on its way out; --kill-after
+# covers it ignoring that. timeout exits 124 when it fires, which is the one rc worth
+# naming -- every caller treats the rest as "nak failed".
+nak_relay() { # <nak args...>
+    local rc=0
+    timeout --signal=INT --kill-after=5 "$MAILBOX_RELAY_TIMEOUT" nak "$@" || rc=$?
+    (( rc == 124 )) && printf '\033[1;31mmailbox:\033[0m relay %s did not answer within %ss\n' \
+        "$NOSTR_MAILBOX_RELAY" "$MAILBOX_RELAY_TIMEOUT" >&2
+    return "$rc"
+}
+
 nak_publish() { # <content> <to-hex> <subject> [<reply-to-id>]
     local args=( event -k "$KIND_MESSAGE"
                  --tag "p=$2" --tag "subject=$3"
                  --tag "from_name=$MAILBOX_AVATAR" )
     [[ -n "${4:-}" ]] && args+=( --tag "e=$4;;reply" )
-    nak "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
+    nak_relay "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
 }
 
 nak_fetch() { # -> one event JSON per line
-    nak req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
+    nak_relay req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
 }
 
 nak_verify() { nak verify 2>/dev/null; }                    # event JSON on stdin
@@ -224,6 +242,18 @@ cmd_contacts() { jq -r 'to_entries[] | "  \(.key)  \(.value.npub)"' "$MAILBOX_RE
 
 cmd_fetch() {
     md_init
+    # The events are read from a file rather than straight from `nak_fetch`, because a
+    # process substitution throws its exit status away: a fetch that timed out would
+    # feed the loop nothing and report "claimed 0 new", which is exactly what a healthy
+    # empty mailbox prints. A failed fetch has to be distinguishable from no mail.
+    local raw rc=0
+    raw="$(mktemp "${TMPDIR:-/tmp}/mailbox-fetch.XXXXXX")"
+    nak_fetch > "$raw" || rc=$?
+    if (( rc != 0 )); then
+        rm -f "$raw"
+        die "fetch failed (nak exit $rc) -- nothing was claimed and the maildir is unchanged"
+    fi
+
     local n=0 dup=0 bad=0 ev id created
     while IFS= read -r ev; do
         [[ -n "$ev" ]] || continue
@@ -237,7 +267,8 @@ cmd_fetch() {
         created=$(jq -r '.created_at' <<<"$ev")
         printf '%s' "$ev" | render | md_deliver "$INBOX" "$id" "$created" "" new >/dev/null
         n=$((n+1))
-    done < <(nak_fetch)
+    done < "$raw"
+    rm -f "$raw"
     say "claimed $n new, skipped $dup already held$( ((bad)) && printf ', REJECTED %d unverified' "$bad")"
 }
 
@@ -293,7 +324,17 @@ cmd_send() {
     local ev rc=0
     ev="$(nak_publish "$body" "$to_hex" "$subject" "$reply")" || rc=$?
     (( rc == 0 )) || die "publish failed -- nothing was sent and nothing was archived"
-    local id created; id=$(jq -r '.id' <<<"$ev"); created=$(jq -r '.created_at' <<<"$ev")
+    # nak exiting 0 is not proof that it published. It has been seen to exit clean
+    # having printed nothing at all, and an unchecked empty result was ARCHIVED: two
+    # empty fields make the filename "..<avatar>:2,S", a dotfile that `ls .Sent/cur`
+    # does not show, under a "sent to <avatar> ()" line with an empty id. That is the
+    # one outcome worth failing hard on -- a message the sender believes was delivered.
+    # So a send is believed only when the signed event comes back.
+    local id created
+    id="$(jq -r '.id // empty' <<<"$ev" 2>/dev/null || true)"
+    created="$(jq -r '.created_at // empty' <<<"$ev" 2>/dev/null || true)"
+    [[ "$id" =~ ^[0-9a-f]{64}$ && "$created" =~ ^[0-9]+$ ]] || die \
+        "publish printed no signed event -- treat it as NOT SENT and retry; nothing was archived"
     printf '%s' "$ev" | render | md_deliver "$SENT" "$id" "$created" "S" cur >/dev/null
     say "sent to $to  ($id)"
 }
