@@ -6,9 +6,10 @@
 #   mailbox fetch                               claim new mail from the relay
 #   mailbox list [--all]                        unread (default) or everything
 #   mailbox read <event-id>                     print it; marks it seen
-#   mailbox send <avatar> --subject S [--body-file F | body]  sign + publish
+#   mailbox send <avatar> --subject S [--ack] [--body-file F | body]  sign + publish
 #   mailbox reply <event-id> [--body-file F | body]           threaded reply
 #   mailbox delete <event-id>                   unsend mail YOU sent (NIP-09)
+#   mailbox list --all                          ... and the ack state of what you sent
 #
 # WHAT THE RELAY CAN SEE
 #
@@ -45,6 +46,11 @@ set -euo pipefail
 
 KIND_MESSAGE=3838
 KIND_DELETION=5
+# NIP-25 reaction. An ack is a reaction to a message: it carries no body of its
+# own, which is why it needs no encryption -- it discloses "this id reached this
+# key", and the relay reads that off the p tags either way. Reusing the standard
+# kind also means the relay needed no change: ours gates on pubkeys, not kinds.
+KIND_ACK=7
 NIP44_MAX=65535   # NIP-44 plaintext limit, in bytes; nak does not enforce it
 
 : "${AVATAR_ROOT:=/project}"
@@ -96,9 +102,12 @@ nak_decrypt() { # <peer-hex> <ciphertext>
 
 # Subject and from_name are no longer tags: the subject rides inside the
 # ciphertext, and the sender's name is the registry's reading of the author key.
-nak_publish() { # <ciphertext> <to-hex> [<reply-to-id>]
+nak_publish() { # <ciphertext> <to-hex> [<reply-to-id>] [ack]
     local args=( event -k "$KIND_MESSAGE" --tag "p=$2" --tag "encrypted=nip44" )
     [[ -n "${3:-}" ]] && args+=( --tag "e=$3;;reply" )
+    # Asking is a tag on the message, so the request travels with it and the
+    # receiver needs no out-of-band knowledge of who wants a receipt.
+    [[ "${4:-}" == ack ]] && args+=( --tag "ack=request" )
     nak "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
 }
 
@@ -108,6 +117,17 @@ nak_delete() { # <event-id>
 }
 
 nak_get() { nak req -i "$1" "$NOSTR_MAILBOX_RELAY"; }       # <event-id> -> event or nothing
+
+# "+" is NIP-25's content for a positive reaction; the ack tag says WHICH of the
+# two facts this is. k records the kind reacted to, as NIP-25 asks.
+nak_ack() { # <message-id> <message-author-hex> <delivered|read>
+    nak event -k "$KIND_ACK" --tag "e=$1" --tag "p=$2" --tag "k=$KIND_MESSAGE" \
+        --tag "ack=$3" -c "+" "$NOSTR_MAILBOX_RELAY"
+}
+
+nak_fetch_acks() { # -> one ack event JSON per line
+    nak req -k "$KIND_ACK" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
+}
 
 nak_fetch() { # -> one event JSON per line
     nak req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
@@ -128,8 +148,14 @@ MY_PUBKEY="$MY_HEX"
 # ──────────────────────────────────────────────────────── maildir ─────────────
 INBOX="$MAILBOX_ROOT"
 SENT="$MAILBOX_ROOT/.Sent"
+# Acks are not mail and must not arrive in the inbox as if they were -- nobody
+# wants to read a tick. They are kept beside it, and the FILENAME carries both
+# ids: its own (so re-fetching dedupes through md_has, like everything else) and
+# the message it acks, glued with a dash rather than a dot so `md_has <msg-id>`
+# cannot match an ack and report the message itself as already held.
+ACKS="$MAILBOX_ROOT/.Acks"
 
-md_init() { mkdir -p "$INBOX"/{tmp,new,cur} "$SENT"/{tmp,new,cur}; }
+md_init() { mkdir -p "$INBOX"/{tmp,new,cur} "$SENT"/{tmp,new,cur} "$ACKS"/{tmp,cur}; }
 
 # A message is already claimed if any file names its event id. The archive is the
 # index; there is nothing else to consult.
@@ -168,6 +194,67 @@ md_mark_replied() {
     # -ef (same device+inode), not string ==, so the guard holds even if the
     # caller passes a path spelled differently for the same file.
     [[ "$f" -ef "$target" ]] || mv "$f" "$target"
+}
+
+# ─────────────────────────────────────────────────────────── acks ─────────────
+# Acks are AUTOMATIC, and that is the whole design. There is no daemon here, so
+# anything that depends on an agent remembering to send an ack will not be sent:
+# the only reliable moments are the commands that already run. `fetch` is the
+# honest moment for "delivered" (the message is on this avatar's disk) and `read`
+# for "displayed". Neither claims more than it knows -- read means the bytes were
+# printed, not that anyone understood or acted on them.
+#
+# An ack never fails the thing it is acking. A message that arrived has arrived
+# whether or not the receipt got out, and losing the mail because the receipt
+# failed would be the worse outcome by far -- so this warns and returns 0.
+ack_requested() { # event JSON on stdin
+    jq -e '.tags[] | select(.[0]=="ack" and .[1]=="request")' >/dev/null 2>&1
+}
+
+ack_publish() { # <message-id> <message-author-hex> <delivered|read>
+    [[ "$2" == "$MY_HEX" ]] && return 0        # no receipts to ourselves
+    if ! nak_ack "$1" "$2" "$3" >/dev/null 2>&1; then
+        printf '\033[1;31mmailbox:\033[0m could not publish the %s ack for %s -- the mail is fine, the receipt is not\n' \
+            "$3" "${1:0:8}" >&2
+    fi
+    return 0
+}
+
+# What the sender knows about one message it sent. read outranks delivered: a
+# message that was read was necessarily delivered, and one tick is enough.
+ack_state() { # <message-id> -> "" | delivered | read
+    local id="$1"
+    find "$ACKS/cur" -type f -name "*.ack-$id-read.*"      -print -quit 2>/dev/null | grep -q . && { echo read; return; }
+    find "$ACKS/cur" -type f -name "*.ack-$id-delivered.*" -print -quit 2>/dev/null | grep -q . && { echo delivered; return; }
+    echo ""
+}
+
+# Claim acks addressed to us. Fails closed on the same three questions the mail
+# path asks, plus one only a sender can ask: an ack is only believable from the
+# avatar the message was actually ADDRESSED to. Without that check any registry
+# member could tick someone else's message, and a false "delivered" is worse
+# than none -- it is the sender believing a message landed when it did not.
+ack_claim() { # -> count on stdout
+    local ev id msg state author who sent_to f n=0
+    while IFS= read -r ev; do
+        [[ -n "$ev" ]] || continue
+        id="$(jq -r '.id // empty' <<<"$ev")"; [[ -n "$id" ]] || continue
+        md_has "$id" && continue
+        printf '%s' "$ev" | nak_verify || continue
+        author="$(jq -r '.pubkey' <<<"$ev")"
+        who="$(reg_name "$author")"; [[ -n "$who" ]] || continue
+        msg="$(jq -r '(.tags[] | select(.[0]=="e") | .[1]) // ""' <<<"$ev" | head -1)"
+        state="$(jq -r '(.tags[] | select(.[0]=="ack") | .[1]) // ""' <<<"$ev" | head -1)"
+        [[ -n "$msg" && ( "$state" == delivered || "$state" == read ) ]] || continue
+        f="$(find "$SENT/cur" -type f -name "*.$msg.*" 2>/dev/null | head -1)"
+        [[ -n "$f" ]] || continue                       # not a message we sent
+        sent_to="$(hdr "$f" To | cut -d' ' -f1)"
+        [[ "$sent_to" == "$who" ]] || continue          # not from the addressee
+        printf '%s' "$ev" > "$ACKS/tmp/x.$$"
+        mv "$ACKS/tmp/x.$$" "$ACKS/cur/$(jq -r '.created_at' <<<"$ev").$id.ack-$msg-$state.$MAILBOX_AVATAR"
+        n=$((n+1))
+    done < <(nak_fetch_acks)
+    printf '%s' "$n"
 }
 
 # ─────────────────────────────────────────────────────── envelope ─────────────
@@ -227,6 +314,9 @@ render() { # event JSON on stdin -> RFC 5322 on stdout
     printf 'X-Nostr-Event-Id: %s\n' "$id"
     printf 'X-Nostr-Pubkey: %s\n' "$from_hex"
     printf 'X-Nostr-Kind: %s\n' "$(jq -r '.kind' <<<"$ev")"
+    # The archive is the only record, so a request that is not written here is a
+    # request `mailbox read` can never see: it reads the file, not the event.
+    printf '%s' "$ev" | ack_requested && printf 'X-Nostr-Ack-Request: yes\n'
     printf 'X-Nostr-Sig: %s\n' "$(jq -r '.sig' <<<"$ev")"
     printf 'X-Nostr-Encryption: %s\n' \
         "$(jq -r '(.tags[] | select(.[0]=="encrypted") | .[1]) // "none"' <<<"$ev" | head -1)"
@@ -299,38 +389,67 @@ cmd_fetch() {
         created=$(jq -r '.created_at' <<<"$ev")
         printf '%s' "$opened" | render | md_deliver "$INBOX" "$id" "$created" "" new >/dev/null
         n=$((n+1))
+        # Delivered, meaning: it is on this avatar's disk. Acked after the archive
+        # write, never before -- a receipt for a message we then failed to keep
+        # would be a lie, and the order is the only thing that guarantees it.
+        printf '%s' "$ev" | ack_requested && ack_publish "$id" "$(jq -r '.pubkey' <<<"$ev")" delivered
     done < <(nak_fetch)
-    say "claimed $n new, skipped $dup already held$( ((bad)) && printf ', REJECTED %d unverified' "$bad")"
+    local acked; acked="$(ack_claim)"
+    say "claimed $n new, skipped $dup already held$( ((bad)) && printf ', REJECTED %d unverified' "$bad")$( (( acked )) && printf ', %d ack(s) for mail you sent' "$acked")"
 }
 
 cmd_list() {
     local dirs=("$INBOX/new")
     [[ "${1:-}" == "--all" ]] && dirs+=("$INBOX/cur" "$SENT/cur")
-    local f
+    local f id state label
     find "${dirs[@]}" -type f 2>/dev/null | sort -r | while read -r f; do
-        printf '  %-10s %-28s %s\n' \
-            "$([[ "$f" == */new/* ]] && echo unread || echo seen)" \
-            "$(hdr "$f" From | cut -d' ' -f1)" \
-            "$(hdr "$f" Subject)"
-        printf '  %-10s %s\n' '' "$(hdr "$f" X-Nostr-Event-Id)"
+        id="$(hdr "$f" X-Nostr-Event-Id)"
+        # For mail WE sent, the useful state is not whether we have read it -- we
+        # wrote it -- but whether the other end has. An asked-for ack that has
+        # not come back is worth seeing as "sent", not as silence.
+        if [[ "$f" == */.Sent/* ]]; then
+            state="$(ack_state "$id")"
+            if [[ -n "$state" ]]; then label="$state"
+            elif [[ "$(hdr "$f" X-Nostr-Ack-Request)" == yes ]]; then label="awaiting ack"
+            else label="sent"; fi
+        else
+            label="$([[ "$f" == */new/* ]] && echo unread || echo seen)"
+        fi
+        printf '  %-13s %-28s %s\n' "$label" "$(hdr "$f" From | cut -d' ' -f1)" "$(hdr "$f" Subject)"
+        printf '  %-13s %s\n' '' "$id"
     done
 }
 
 cmd_read() {
     local f; f="$(md_find "${1:?usage: mailbox read <event-id>}")"
     [[ -n "$f" ]] || die "no message with id ${1}"
+    # Whether this is the FIRST read has to be decided before md_mark_seen moves
+    # the file, since that move is what records it. Re-reading is not a new fact
+    # and must not publish a second receipt.
+    # Both of these are read BEFORE md_mark_seen, because that moves the file:
+    # whether this is the first read, and the headers the receipt is built from.
+    # Asking $f afterwards asks a path that no longer exists, and the receipt
+    # silently never goes out.
+    local first=0 want="" msg_id="" author=""
+    [[ "$f" == */new/* ]] && first=1
+    want="$(hdr "$f" X-Nostr-Ack-Request)"
+    msg_id="$(hdr "$f" X-Nostr-Event-Id)"
+    author="$(hdr "$f" X-Nostr-Pubkey)"
     cat "$f"
     md_mark_seen "$f"
+    (( first )) && [[ "$want" == yes ]] && ack_publish "$msg_id" "$author" read
+    return 0
 }
 
 cmd_send() {
-    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S [--body-file F | <inline body>]"
+    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S [--ack] [--body-file F | <inline body>]"
     local to="$1"; shift
-    local subject="" reply="" body_file=""
+    local subject="" reply="" body_file="" ack=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --subject)   subject="$2"; shift 2 ;;
             --reply)     reply="$2"; shift 2 ;;
+            --ack)       ack=ack; shift ;;
             --body-file) body_file="$2"; shift 2 ;;
             *)           break ;;
         esac
@@ -354,7 +473,7 @@ cmd_send() {
     md_init
     local sealed ev rc=0
     sealed="$(seal "$to_hex" "$subject" "$body")" || die "encryption failed -- nothing was sent"
-    ev="$(nak_publish "$sealed" "$to_hex" "$reply")" || rc=$?
+    ev="$(nak_publish "$sealed" "$to_hex" "$reply" "$ack")" || rc=$?
     (( rc == 0 )) || die "publish failed -- nothing was sent and nothing was archived"
     local id created; id=$(jq -r '.id' <<<"$ev"); created=$(jq -r '.created_at' <<<"$ev")
     # The sent copy is archived by decrypting what was actually published, so a
