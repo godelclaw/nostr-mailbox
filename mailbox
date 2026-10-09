@@ -8,7 +8,14 @@
 #   mailbox read <event-id>                     print it; marks it seen
 #   mailbox send <avatar> --subject S [--body-file F | body]  sign + publish
 #   mailbox reply <event-id> [--body-file F | body]           threaded reply
+#   mailbox delete <event-id>                   unsend mail YOU sent (NIP-09)
 #
+# WHAT THE RELAY CAN SEE
+#
+# Subject and body travel NIP-44 encrypted to the recipient's key, so a message
+# left on the relay is unreadable to anyone but its two parties. What stays in
+# the clear is who wrote to whom and when (the author key, the "p" tag, the
+# reply "e" tag) -- hiding that is NIP-17 gift-wrap, a separate decision.
 # WHY THERE IS NO DAEMON
 #
 # The relay is the persistence layer: it holds every message until it is claimed.
@@ -37,6 +44,8 @@
 set -euo pipefail
 
 KIND_MESSAGE=3838
+KIND_DELETION=5
+NIP44_MAX=65535   # NIP-44 plaintext limit, in bytes; nak does not enforce it
 
 : "${AVATAR_ROOT:=/project}"
 
@@ -84,6 +93,18 @@ nak_pubkey() { printf %s "$1" | nak key public; }           # sec -> pubkey-hex
 # one less place it is visible.
 export NOSTR_SECRET_KEY="${NOSTR_MAILBOX_NSEC:-}"
 
+# The plaintext is an argument because nak reads it from nowhere else (stdin is
+# ignored). Decrypt appends one newline, stripped so the body round-trips exactly.
+#
+# Deliberately NOT routed through nak_relay below: encrypting and decrypting are
+# local operations that never open a socket, so bounding them would bound nothing
+# and a 20s ceiling on a CPU-bound call is a timeout waiting to be mysterious.
+nak_encrypt() { nak encrypt -p "$1" "$2"; }                 # <peer-hex> <plaintext>
+nak_decrypt() { # <peer-hex> <ciphertext>
+    local out; out="$(nak decrypt -p "$1" "$2"; printf x)" || return 1
+    out="${out%x}"; printf '%s' "${out%$'\n'}"
+}
+
 # SIGINT rather than SIGTERM so nak closes the websocket on its way out; --kill-after
 # covers it ignoring that. timeout exits 124 when it fires, which is the one rc worth
 # naming -- every caller treats the rest as "nak failed".
@@ -95,13 +116,24 @@ nak_relay() { # <nak args...>
     return "$rc"
 }
 
-nak_publish() { # <content> <to-hex> <subject> [<reply-to-id>]
-    local args=( event -k "$KIND_MESSAGE"
-                 --tag "p=$2" --tag "subject=$3"
-                 --tag "from_name=$MAILBOX_AVATAR" )
-    [[ -n "${4:-}" ]] && args+=( --tag "e=$4;;reply" )
+# Subject and from_name are no longer tags: the subject rides inside the
+# ciphertext, and the sender's name is the registry's reading of the author key.
+nak_publish() { # <ciphertext> <to-hex> [<reply-to-id>]
+    local args=( event -k "$KIND_MESSAGE" --tag "p=$2" --tag "encrypted=nip44" )
+    [[ -n "${3:-}" ]] && args+=( --tag "e=$3;;reply" )
     nak_relay "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
 }
+
+# Both of these reach the relay, so both go through nak_relay -- the unsend path
+# was written before that bound existed, and an unsend that hangs forever is the
+# same failure the bound was added for. Their callers already check the rc and
+# fail closed, so a 124 surfaces as "unconfirmed, rerun" rather than as success.
+nak_delete() { # <event-id>
+    nak_relay event -k "$KIND_DELETION" --tag "e=$1" --tag "k=$KIND_MESSAGE" \
+        -c "unsent by $MAILBOX_AVATAR" "$NOSTR_MAILBOX_RELAY"
+}
+
+nak_get() { nak_relay req -i "$1" "$NOSTR_MAILBOX_RELAY"; } # <event-id> -> event or nothing
 
 nak_fetch() { # -> one event JSON per line
     nak_relay req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
@@ -164,6 +196,32 @@ md_mark_replied() {
     [[ "$f" -ef "$target" ]] || mv "$f" "$target"
 }
 
+# ─────────────────────────────────────────────────────── envelope ─────────────
+# seal: subject + body -> NIP-44 ciphertext for one recipient. The plaintext is a
+# small JSON object so the subject is hidden along with the body.
+seal() { # <to-hex> <subject> <body>
+    local pt; pt="$(jq -nc --arg s "$2" --arg b "$3" '{subject: $s, body: $b}')"
+    (( $(printf '%s' "$pt" | wc -c) <= NIP44_MAX )) \
+        || die "refusing to send: the message is over NIP-44's $NIP44_MAX-byte limit -- share the file and send its location"
+    nak_encrypt "$1" "$pt"
+}
+
+# open: an event as fetched -> the same event with the plaintext body in .content
+# and the subject back as a tag, so render() needs no second path. NIP-44 keys are
+# symmetric, so we decrypt our own sent copy with the recipient's key. A plaintext
+# event (sent by a mailbox older than this one) passes through unchanged.
+open_event() { # event JSON on stdin -> event JSON on stdout; fails if it cannot decrypt
+    local ev peer pt; ev="$(cat)"
+    if ! jq -e '.tags[] | select(.[0]=="encrypted" and .[1]=="nip44")' <<<"$ev" >/dev/null; then
+        printf '%s' "$ev"; return 0
+    fi
+    peer="$(jq -r '.pubkey' <<<"$ev")"
+    [[ "$peer" == "$MY_HEX" ]] && peer="$(jq -r '(.tags[] | select(.[0]=="p") | .[1]) // ""' <<<"$ev" | head -1)"
+    pt="$(nak_decrypt "$peer" "$(jq -r '.content' <<<"$ev")" 2>/dev/null)" || return 1
+    jq -e 'has("subject") and has("body")' <<<"$pt" >/dev/null 2>&1 || return 1
+    jq -c --argjson pt "$pt" '.content = $pt.body | .tags += [["subject", $pt.subject]]' <<<"$ev"
+}
+
 # ────────────────────────────────────────────────────── rfc 5322 ──────────────
 # The envelope is real mail headers, so the archive is readable by anything that
 # reads mail and the Nostr specifics ride along as X- headers. Threading is free:
@@ -196,6 +254,8 @@ render() { # event JSON on stdin -> RFC 5322 on stdout
     printf 'X-Nostr-Pubkey: %s\n' "$from_hex"
     printf 'X-Nostr-Kind: %s\n' "$(jq -r '.kind' <<<"$ev")"
     printf 'X-Nostr-Sig: %s\n' "$(jq -r '.sig' <<<"$ev")"
+    printf 'X-Nostr-Encryption: %s\n' \
+        "$(jq -r '(.tags[] | select(.[0]=="encrypted") | .[1]) // "none"' <<<"$ev" | head -1)"
     printf 'MIME-Version: 1.0\n'
     printf 'Content-Type: text/markdown; charset=utf-8\n'
     printf '\n%s\n' "$content"
@@ -227,6 +287,12 @@ cmd_doctor() {
         local derived; derived="$(nak_pubkey "$NOSTR_MAILBOX_NSEC" 2>/dev/null || true)"
         if [[ "$derived" == "$MY_HEX" ]]; then
             say "key: derives $MY_HEX -- matches registry entry for $MAILBOX_AVATAR"
+            local ct; ct="$(nak_encrypt "$MY_HEX" "doctor" 2>/dev/null || true)"
+            if [[ -n "$ct" && "$(nak_decrypt "$MY_HEX" "$ct" 2>/dev/null)" == "doctor" ]]; then
+                say "encryption: NIP-44 round trip ok"
+            else
+                printf '  BROKEN: NIP-44 encrypt/decrypt does not round-trip with this nak\n'; ok=1
+            fi
         else
             printf '  WRONG KEY: derives %s, registry says %s\n' "${derived:-<nak failed>}" "$MY_HEX"; ok=1
         fi
@@ -254,18 +320,22 @@ cmd_fetch() {
         die "fetch failed (nak exit $rc) -- nothing was claimed and the maildir is unchanged"
     fi
 
-    local n=0 dup=0 bad=0 ev id created
+    local n=0 dup=0 bad=0 ev id created opened
+    reject() { bad=$((bad+1)); printf '  REJECTED %s: %s\n' "${id:0:8}" "$1" >&2; }
     while IFS= read -r ev; do
         [[ -n "$ev" ]] || continue
         id=$(jq -r '.id // empty' <<<"$ev"); [[ -n "$id" ]] || continue
         if md_has "$id"; then dup=$((dup+1)); continue; fi
-        # Fail closed. An event that does not verify is not archived -- the relay's
-        # allowlist is not a substitute for checking the signature ourselves.
-        if ! printf '%s' "$ev" | nak_verify; then
-            bad=$((bad+1)); printf '  REJECTED %s: signature does not verify\n' "${id:0:8}" >&2; continue
-        fi
+        # Fail closed, three times. An event that does not verify is not archived --
+        # the relay's allowlist is not a substitute for checking the signature
+        # ourselves. A valid signature only proves SOME key signed it, so the key
+        # must also be one registry.json names. And mail we cannot decrypt is
+        # reported rather than archived as ciphertext.
+        if ! printf '%s' "$ev" | nak_verify; then reject "signature does not verify"; continue; fi
+        if [[ -z "$(reg_name "$(jq -r '.pubkey' <<<"$ev")")" ]]; then reject "sender is not in the registry"; continue; fi
+        if ! opened="$(printf '%s' "$ev" | open_event)"; then reject "cannot decrypt"; continue; fi
         created=$(jq -r '.created_at' <<<"$ev")
-        printf '%s' "$ev" | render | md_deliver "$INBOX" "$id" "$created" "" new >/dev/null
+        printf '%s' "$opened" | render | md_deliver "$INBOX" "$id" "$created" "" new >/dev/null
         n=$((n+1))
     done < "$raw"
     rm -f "$raw"
@@ -321,8 +391,9 @@ cmd_send() {
     to_hex="$(jq -r --arg n "$to" '.[$n].pubkey_hex // empty' "$MAILBOX_REGISTRY")"
     [[ -n "$to_hex" ]] || die "unknown recipient $to -- not in the registry; try: mailbox contacts"
     md_init
-    local ev rc=0
-    ev="$(nak_publish "$body" "$to_hex" "$subject" "$reply")" || rc=$?
+    local sealed ev rc=0
+    sealed="$(seal "$to_hex" "$subject" "$body")" || die "encryption failed -- nothing was sent"
+    ev="$(nak_publish "$sealed" "$to_hex" "$reply")" || rc=$?
     (( rc == 0 )) || die "publish failed -- nothing was sent and nothing was archived"
     # nak exiting 0 is not proof that it published. It has been seen to exit clean
     # having printed nothing at all, and an unchecked empty result was ARCHIVED: two
@@ -335,7 +406,13 @@ cmd_send() {
     created="$(jq -r '.created_at // empty' <<<"$ev" 2>/dev/null || true)"
     [[ "$id" =~ ^[0-9a-f]{64}$ && "$created" =~ ^[0-9]+$ ]] || die \
         "publish printed no signed event -- treat it as NOT SENT and retry; nothing was archived"
-    printf '%s' "$ev" | render | md_deliver "$SENT" "$id" "$created" "S" cur >/dev/null
+    # Only then archive, and archive the DECRYPTED copy: $ev's content is ciphertext
+    # now, so writing it to .Sent would store a message its own sender cannot read.
+    # Decrypting what was actually published also means a message that cannot be
+    # opened again fails loudly here rather than at the reader.
+    local opened
+    opened="$(printf '%s' "$ev" | open_event)" || die "sent $id, but could not decrypt it back for the archive"
+    printf '%s' "$opened" | render | md_deliver "$SENT" "$id" "$created" "S" cur >/dev/null
     say "sent to $to  ($id)"
 }
 
@@ -352,6 +429,29 @@ cmd_reply() {
     md_mark_replied "$f"
 }
 
+# Unsend. Only the author can delete an event, so only mail in .Sent qualifies;
+# a recipient who already fetched it keeps their copy -- this is not
+# delete-on-read. A relay may ignore NIP-09, so we ask it for the event
+# afterwards and say plainly if it is still there.
+cmd_delete() {
+    local id="${1:?usage: mailbox delete <event-id>}" f
+    f="$(find "$SENT/cur" -type f -name "*.$id.*" 2>/dev/null | head -1)"
+    [[ -n "$f" ]] || die "no sent message with id $id -- you can only unsend mail you sent (mailbox list --all)"
+    nak_delete "$id" >/dev/null || die "the deletion request did not publish -- nothing changed"
+    # An empty answer means gone only if the query itself succeeded: a relay that
+    # could not be asked also answers with nothing, and must not read as success.
+    local served
+    served="$(nak_get "$id" 2>/dev/null)" \
+        || die "deletion requested, but the relay could not be asked whether it still serves $id -- unconfirmed; rerun mailbox delete"
+    if [[ -n "$served" ]]; then
+        die "deletion requested, but the relay STILL SERVES $id -- it has not honoured NIP-09"
+    fi
+    # Maildir's T flag: trashed. The archive keeps the copy and records the unsend.
+    local base target; base="$(basename "$f")"; target="$SENT/cur/${base%%:*}:2,ST"
+    [[ "$f" -ef "$target" ]] || mv "$f" "$target"
+    say "unsent $id -- the relay no longer serves it; copies already fetched remain"
+}
+
 # When sourced (e.g. by tests) define the functions but do not dispatch.
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] || return 0
 
@@ -363,6 +463,7 @@ case "${1:-doctor}" in
     read)     shift; cmd_read "$@" ;;
     send)     shift; cmd_send "$@" ;;
     reply)    shift; cmd_reply "$@" ;;
-    -h|--help|help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown command '$1' (doctor|contacts|fetch|list|read|send|reply)" ;;
+    delete)   shift; cmd_delete "$@" ;;
+    -h|--help|help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$1' (doctor|contacts|fetch|list|read|send|reply|delete)" ;;
 esac
