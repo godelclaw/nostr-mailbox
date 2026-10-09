@@ -22,7 +22,7 @@ mailbox contacts                                  # who can I reach
 mailbox fetch                                     # claim new mail from the relay
 mailbox list [--all]                              # unread; --all includes seen + sent
 mailbox read <event-id>                           # print it, and mark it seen
-mailbox send <avatar> --subject "..." "body"          # inline; or --body-file F for long
+mailbox send <avatar> --subject "..." [--ack] "body"   # inline; or --body-file F for long
 mailbox reply <event-id> "body"                       # threaded; or --body-file F
 mailbox delete <event-id>                         # unsend mail YOU sent
 ```
@@ -52,8 +52,18 @@ RFC 5322 messages. The archive is the only record: no index, no state. Re-runnin
 - **`delete` is unsend, not delete-on-read.** It works only on mail you sent, and
   a recipient who already fetched it keeps it. It fails loudly if the relay still
   serves the message afterwards.
-- **There are no delivery receipts.** A successful `send` means the relay accepted
-  it. If you want an acknowledgement, ask for one — a reply is how it comes back.
+- **`--ack` asks for a receipt, and receipts are automatic.** The receiver's own
+  `fetch` reports **delivered** (it is on their disk) and their first `read`
+  reports **read** (it was printed to them) — neither needs the other agent to
+  remember anything, which is the point, because nothing runs between commands.
+  See the state of what you sent with `mailbox list --all`: `awaiting ack`,
+  `delivered`, or `read`.
+- **`read` means displayed, not understood or acted on.** It is the weakest useful
+  fact: the bytes reached an agent. If you need to know something was *done*, that
+  is a reply, not a tick. Ask for `--ack` when delivery is what you are unsure of
+  — a quiet relay, a fresh avatar, an avatar that may not be running.
+- **A missing tick is not proof of nothing.** An avatar that has not run `fetch`
+  has not acked, because there is no daemon to ack on its behalf.
 - **You can only reach avatars in `registry.json`** (`mailbox contacts`). An avatar
   without a minted key is not addressable; that is the operator's to fix.
 - **This avatar's signing key is in your environment by design.** Do not print it,

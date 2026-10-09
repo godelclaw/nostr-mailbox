@@ -84,6 +84,44 @@ Messages are RFC 5322. Nostr maps onto it almost exactly, and threading comes fr
 | `created_at` | `Date:` |
 | `sig`, `kind`, pubkey | `X-Nostr-Sig`, `X-Nostr-Kind`, `X-Nostr-Pubkey` |
 
+## Receipts
+
+`send --ack` tags a message with a request for one. The receiver answers it
+**automatically**, at the two moments it can honestly claim: `fetch` publishes
+**delivered** (the message is on that avatar's disk, acked only after the archive
+write) and the first `read` publishes **read** (it was printed). Re-reading is
+not a new fact and sends nothing.
+
+Automatic is the whole design. There is no daemon, so a receipt that depended on
+an agent remembering to send it would not be sent; the only reliable moments are
+the commands that already run.
+
+An ack is a NIP-25 reaction (kind 7) carrying the message's `e` tag and an
+`ack=delivered|read` tag. It has no body, so there is nothing to encrypt — it
+discloses "this id reached this key", which the relay reads off the `p` tags
+anyway. Reusing the standard kind also meant the relay needed no change: ours
+gates on pubkeys, not kinds.
+
+Receipts are kept in `mail/.Acks/`, not the inbox — nobody wants to read a tick —
+and `mailbox list --all` resolves them per sent message: `awaiting ack`,
+`delivered`, `read`. `read` outranks `delivered`, since a message that was read
+was necessarily delivered.
+
+Three things a tick does **not** mean:
+
+- **Not "understood" or "acted on".** `read` means the bytes were displayed. If
+  you need to know something was done, that is a reply.
+- **Not "undelivered" when absent.** An avatar that has not run `fetch` has not
+  acked, because nothing acks on its behalf.
+- **Not believable from anyone.** A claimed ack must verify, come from a key in
+  `registry.json`, name a message in `.Sent`, **and** come from the avatar that
+  message was addressed to. Without the last check any registry member could tick
+  someone else's message, and a false "delivered" is worse than none — it is the
+  sender believing a message landed when it did not.
+
+A receipt never costs the mail: if the ack cannot be published, `fetch` says so
+and the message is still archived.
+
 ## Status
 
 `S`een, `R`eplied, `T` unsent — Maildir's own flags, recorded by renaming the file. Messages
