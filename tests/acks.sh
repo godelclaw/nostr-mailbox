@@ -72,9 +72,12 @@ nak_fetch()      { printf '%s\n' ${FEED[@]+"${FEED[@]}"}; }
 nak_fetch_acks() { printf '%s\n' ${ACKFEED[@]+"${ACKFEED[@]}"}; }
 
 # ── asking ───────────────────────────────────────────────────────────────────
-args="$( nak() { printf '%s\n' "$@"; }; nak_publish ct "$B" "" ack )"
+# The seam is nak_relay, not nak: every relay call is bounded by `timeout`, and
+# timeout execs a BINARY, so a `nak()` shell function is not seen at all -- the
+# real nak would run and dial the dead relay. Stub the bound instead.
+args="$( nak_relay() { printf '%s\n' "$@"; }; nak_publish ct "$B" "" ack )"
 [[ "$args" == *"ack=request"* ]] && is 1 1 "--ack tags the message with a request" || is 1 0 "--ack tags the message with a request"
-args="$( nak() { printf '%s\n' "$@"; }; nak_publish ct "$B" "" "" )"
+args="$( nak_relay() { printf '%s\n' "$@"; }; nak_publish ct "$B" "" "" )"
 [[ "$args" == *"ack=request"* ]] && is 1 0 "without --ack there is no request tag" || is 1 1 "without --ack there is no request tag"
 
 ct="$(as "$B_SEC" "$B" seal "$A" "please confirm" "body")"

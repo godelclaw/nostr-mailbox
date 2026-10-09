@@ -72,6 +72,13 @@ fi
 : "${MAILBOX_REGISTRY:=$AVATAR_ROOT/tools/nostr-mailbox/registry.json}"
 : "${NOSTR_MAILBOX_RELAY:=ws://nostr-relay:8080}"
 
+# Every call that touches the relay is bounded by this, because nak has no timeout
+# of its own: a relay that accepts the connection and then says nothing leaves
+# `nak req` waiting for an EOSE that never comes, and `nak event` waiting for an OK.
+# Twenty seconds is far longer than a local relay needs and short enough that a
+# wedged call is a message rather than a hung session.
+: "${MAILBOX_RELAY_TIMEOUT:=20}"
+
 die() { printf '\033[1;31mmailbox:\033[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\033[1;34mmailbox:\033[0m %s\n' "$*"; }
 
@@ -94,10 +101,25 @@ export NOSTR_SECRET_KEY="${NOSTR_MAILBOX_NSEC:-}"
 
 # The plaintext is an argument because nak reads it from nowhere else (stdin is
 # ignored). Decrypt appends one newline, stripped so the body round-trips exactly.
+#
+# Deliberately NOT routed through nak_relay below: encrypting and decrypting are
+# local operations that never open a socket, so bounding them would bound nothing
+# and a 20s ceiling on a CPU-bound call is a timeout waiting to be mysterious.
 nak_encrypt() { nak encrypt -p "$1" "$2"; }                 # <peer-hex> <plaintext>
 nak_decrypt() { # <peer-hex> <ciphertext>
     local out; out="$(nak decrypt -p "$1" "$2"; printf x)" || return 1
     out="${out%x}"; printf '%s' "${out%$'\n'}"
+}
+
+# SIGINT rather than SIGTERM so nak closes the websocket on its way out; --kill-after
+# covers it ignoring that. timeout exits 124 when it fires, which is the one rc worth
+# naming -- every caller treats the rest as "nak failed".
+nak_relay() { # <nak args...>
+    local rc=0
+    timeout --signal=INT --kill-after=5 "$MAILBOX_RELAY_TIMEOUT" nak "$@" || rc=$?
+    (( rc == 124 )) && printf '\033[1;31mmailbox:\033[0m relay %s did not answer within %ss\n' \
+        "$NOSTR_MAILBOX_RELAY" "$MAILBOX_RELAY_TIMEOUT" >&2
+    return "$rc"
 }
 
 # Subject and from_name are no longer tags: the subject rides inside the
@@ -108,29 +130,33 @@ nak_publish() { # <ciphertext> <to-hex> [<reply-to-id>] [ack]
     # Asking is a tag on the message, so the request travels with it and the
     # receiver needs no out-of-band knowledge of who wants a receipt.
     [[ "${4:-}" == ack ]] && args+=( --tag "ack=request" )
-    nak "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
+    nak_relay "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
 }
 
+# Both of these reach the relay, so both go through nak_relay -- the unsend path
+# was written before that bound existed, and an unsend that hangs forever is the
+# same failure the bound was added for. Their callers already check the rc and
+# fail closed, so a 124 surfaces as "unconfirmed, rerun" rather than as success.
 nak_delete() { # <event-id>
-    nak event -k "$KIND_DELETION" --tag "e=$1" --tag "k=$KIND_MESSAGE" \
+    nak_relay event -k "$KIND_DELETION" --tag "e=$1" --tag "k=$KIND_MESSAGE" \
         -c "unsent by $MAILBOX_AVATAR" "$NOSTR_MAILBOX_RELAY"
 }
 
-nak_get() { nak req -i "$1" "$NOSTR_MAILBOX_RELAY"; }       # <event-id> -> event or nothing
+nak_get() { nak_relay req -i "$1" "$NOSTR_MAILBOX_RELAY"; } # <event-id> -> event or nothing
 
 # "+" is NIP-25's content for a positive reaction; the ack tag says WHICH of the
 # two facts this is. k records the kind reacted to, as NIP-25 asks.
 nak_ack() { # <message-id> <message-author-hex> <delivered|read>
-    nak event -k "$KIND_ACK" --tag "e=$1" --tag "p=$2" --tag "k=$KIND_MESSAGE" \
+    nak_relay event -k "$KIND_ACK" --tag "e=$1" --tag "p=$2" --tag "k=$KIND_MESSAGE" \
         --tag "ack=$3" -c "+" "$NOSTR_MAILBOX_RELAY"
 }
 
 nak_fetch_acks() { # -> one ack event JSON per line
-    nak req -k "$KIND_ACK" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
+    nak_relay req -k "$KIND_ACK" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
 }
 
 nak_fetch() { # -> one event JSON per line
-    nak req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
+    nak_relay req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
 }
 
 nak_verify() { nak verify 2>/dev/null; }                    # event JSON on stdin
@@ -372,6 +398,18 @@ cmd_contacts() { jq -r 'to_entries[] | "  \(.key)  \(.value.npub)"' "$MAILBOX_RE
 
 cmd_fetch() {
     md_init
+    # The events are read from a file rather than straight from `nak_fetch`, because a
+    # process substitution throws its exit status away: a fetch that timed out would
+    # feed the loop nothing and report "claimed 0 new", which is exactly what a healthy
+    # empty mailbox prints. A failed fetch has to be distinguishable from no mail.
+    local raw rc=0
+    raw="$(mktemp "${TMPDIR:-/tmp}/mailbox-fetch.XXXXXX")"
+    nak_fetch > "$raw" || rc=$?
+    if (( rc != 0 )); then
+        rm -f "$raw"
+        die "fetch failed (nak exit $rc) -- nothing was claimed and the maildir is unchanged"
+    fi
+
     local n=0 dup=0 bad=0 ev id created opened
     reject() { bad=$((bad+1)); printf '  REJECTED %s: %s\n' "${id:0:8}" "$1" >&2; }
     while IFS= read -r ev; do
@@ -393,7 +431,8 @@ cmd_fetch() {
         # write, never before -- a receipt for a message we then failed to keep
         # would be a lie, and the order is the only thing that guarantees it.
         printf '%s' "$ev" | ack_requested && ack_publish "$id" "$(jq -r '.pubkey' <<<"$ev")" delivered
-    done < <(nak_fetch)
+    done < "$raw"
+    rm -f "$raw"
     local acked; acked="$(ack_claim)"
     say "claimed $n new, skipped $dup already held$( ((bad)) && printf ', REJECTED %d unverified' "$bad")$( (( acked )) && printf ', %d ack(s) for mail you sent' "$acked")"
 }
@@ -475,9 +514,21 @@ cmd_send() {
     sealed="$(seal "$to_hex" "$subject" "$body")" || die "encryption failed -- nothing was sent"
     ev="$(nak_publish "$sealed" "$to_hex" "$reply" "$ack")" || rc=$?
     (( rc == 0 )) || die "publish failed -- nothing was sent and nothing was archived"
-    local id created; id=$(jq -r '.id' <<<"$ev"); created=$(jq -r '.created_at' <<<"$ev")
-    # The sent copy is archived by decrypting what was actually published, so a
-    # message that could not be opened again fails loudly here, not at the reader.
+    # nak exiting 0 is not proof that it published. It has been seen to exit clean
+    # having printed nothing at all, and an unchecked empty result was ARCHIVED: two
+    # empty fields make the filename "..<avatar>:2,S", a dotfile that `ls .Sent/cur`
+    # does not show, under a "sent to <avatar> ()" line with an empty id. That is the
+    # one outcome worth failing hard on -- a message the sender believes was delivered.
+    # So a send is believed only when the signed event comes back.
+    local id created
+    id="$(jq -r '.id // empty' <<<"$ev" 2>/dev/null || true)"
+    created="$(jq -r '.created_at // empty' <<<"$ev" 2>/dev/null || true)"
+    [[ "$id" =~ ^[0-9a-f]{64}$ && "$created" =~ ^[0-9]+$ ]] || die \
+        "publish printed no signed event -- treat it as NOT SENT and retry; nothing was archived"
+    # Only then archive, and archive the DECRYPTED copy: $ev's content is ciphertext
+    # now, so writing it to .Sent would store a message its own sender cannot read.
+    # Decrypting what was actually published also means a message that cannot be
+    # opened again fails loudly here rather than at the reader.
     local opened
     opened="$(printf '%s' "$ev" | open_event)" || die "sent $id, but could not decrypt it back for the archive"
     printf '%s' "$opened" | render | md_deliver "$SENT" "$id" "$created" "S" cur >/dev/null

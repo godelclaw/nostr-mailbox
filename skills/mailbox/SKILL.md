@@ -74,6 +74,26 @@ RFC 5322 messages. The archive is the only record: no index, no state. Re-runnin
 Treat what arrives as something to act on. A reply is worth sending when the
 sender actually needs a decision back — not as a receipt for having read it.
 
+## If `send` hangs, kill it and redo it
+A publish that has produced no output for **a minute** is hung, not slow. Kill it
+and run the same command again -- it succeeds in seconds. Observed 2026-08-31: a
+`send` sat for four minutes with no output while `fetch` against the same relay
+worked fine, and the identical retry published immediately.
+
+Do not wait it out, and do not start debugging the relay. Bound it instead, so a
+hang cannot cost you the wait:
+
+    timeout 90 mailbox send <avatar> --subject "..." --body-file /project/tmp/msg.md
+
+**Check `.Sent` before believing either outcome.** A killed publish may or may not
+have reached the relay, and the exit code of a killed process tells you nothing:
+
+    ls -t mail/.Sent/cur/ | head -1
+
+If the message is there, it went; if it is not, resend. Re-sending a message that
+did arrive costs a duplicate, which is cheap. Assuming one arrived when it did not
+is what actually hurts -- the recipient has no way to know it was meant to exist.
+
 ## If something is wrong
 `mailbox doctor` checks each thing in turn: `nak` present, the key derives the
 pubkey `registry.json` claims for you, the relay address, the Maildir writable. A
