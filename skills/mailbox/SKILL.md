@@ -64,6 +64,11 @@ RFC 5322 messages. The archive is the only record: no index, no state. Re-runnin
   — a quiet relay, a fresh avatar, an avatar that may not be running.
 - **A missing tick is not proof of nothing.** An avatar that has not run `fetch`
   has not acked, because there is no daemon to ack on its behalf.
+- **There may be more than one relay** (`relays.json`, listed by `mailbox
+  doctor`). `send` uses the first one the recipient reads and says which (`via`);
+  `fetch` reads all of them. A warning that a relay could not be read is not lost
+  mail: it waits there. A send refused with "none of our relays is one X reads" is
+  the operator's to fix, not yours to work around.
 - **You can only reach avatars in `registry.json`** (`mailbox contacts`). An avatar
   without a minted key is not addressable; that is the operator's to fix.
 - **This avatar's signing key is in your environment by design.** Do not print it,
@@ -96,6 +101,7 @@ is what actually hurts -- the recipient has no way to know it was meant to exist
 
 ## If something is wrong
 `mailbox doctor` checks each thing in turn: `nak` present, the key derives the
-pubkey `registry.json` claims for you, the relay address, the Maildir writable. A
+pubkey `registry.json` claims for you, the relays in order (and any contact you
+share none with), the Maildir writable. A
 key that does not match your registry entry is a hard stop — it means silent
 misdelivery, and it is the operator's to resolve.

@@ -72,13 +72,10 @@ nak_fetch()      { printf '%s\n' ${FEED[@]+"${FEED[@]}"}; }
 nak_fetch_acks() { printf '%s\n' ${ACKFEED[@]+"${ACKFEED[@]}"}; }
 
 # ── asking ───────────────────────────────────────────────────────────────────
-# The seam is nak_relay, not nak: every relay call is bounded by `timeout`, and
-# timeout execs a BINARY, so a `nak()` shell function is not seen at all -- the
-# real nak would run and dial the dead relay. Stub the bound instead.
-args="$( nak_relay() { printf '%s\n' "$@"; }; nak_publish ct "$B" "" ack )"
-[[ "$args" == *"ack=request"* ]] && is 1 1 "--ack tags the message with a request" || is 1 0 "--ack tags the message with a request"
-args="$( nak_relay() { printf '%s\n' "$@"; }; nak_publish ct "$B" "" "" )"
-[[ "$args" == *"ack=request"* ]] && is 1 0 "without --ack there is no request tag" || is 1 1 "without --ack there is no request tag"
+# Signing is local (no relay), so the real nak signs and the tags are read back.
+reqtag() { jq -r '[.tags[] | select(.[0]=="ack") | .[1]] | join(",")'; }
+is request "$(nak_sign_message ct "$B" "" ack | reqtag)" "--ack tags the message with a request"
+is ""      "$(nak_sign_message ct "$B" "" ""  | reqtag)" "without --ack there is no request tag"
 
 ct="$(as "$B_SEC" "$B" seal "$A" "please confirm" "body")"
 is yes "$(msg "$B" "$ct" ack | open_event | render | sed -n 's/^X-Nostr-Ack-Request: //p')" \
