@@ -114,9 +114,13 @@ nak_decrypt() { # <peer-hex> <ciphertext>
 # SIGINT rather than SIGTERM so nak closes the websocket on its way out; --kill-after
 # covers it ignoring that. timeout exits 124 when it fires, which is the one rc worth
 # naming -- every caller treats the rest as "nak failed".
-nak_relay() { # <nak args...>
-    local rc=0
-    timeout --signal=INT --kill-after=5 "$MAILBOX_RELAY_TIMEOUT" nak "$@" || rc=$?
+#
+# --auth on every relay call: a relay that demands NIP-42 sign-in (the gated relay,
+# which is what lets the fabric sit on a public address) gets it, signed with the
+# avatar's own key from $NOSTR_SECRET_KEY; a relay that never asks never sees it.
+nak_relay() { # <event|req> <nak args...>
+    local rc=0 verb="$1"; shift
+    timeout --signal=INT --kill-after=5 "$MAILBOX_RELAY_TIMEOUT" nak "$verb" --auth "$@" || rc=$?
     (( rc == 124 )) && printf '\033[1;31mmailbox:\033[0m relay %s did not answer within %ss\n' \
         "$NOSTR_MAILBOX_RELAY" "$MAILBOX_RELAY_TIMEOUT" >&2
     return "$rc"
