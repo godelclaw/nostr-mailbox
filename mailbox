@@ -11,6 +11,25 @@
 #   mailbox delete <event-id>                   unsend mail YOU sent (NIP-09)
 #   mailbox list --all                          ... and the ack state of what you sent
 #
+# WHICH RELAY
+#
+# relays.json (beside registry.json) lists the relays this avatar can reach, in
+# order of preference: the first is the default, the rest are fallbacks, in turn.
+#
+#   {"relays": [{"name": "local",  "url": "ws://nostr-relay:8080"},
+#               {"name": "public", "url": "wss://relay.example.org"}]}
+#
+# Send tries them in that order and stops at the first that takes the message --
+# no broadcast. Fetch reads all of them, because mail waits on whichever relay its
+# sender reached; dedupe is by event id, as always. The NAME is the relay's identity
+# and the URL is only how this machine reaches it, so two avatars may write the same
+# relay under different URLs. That matters because the relays need not overlap: a
+# registry entry may say which relays that contact reads ("relays": ["public"]), and
+# a send to it then tries only those -- a send that lands on a relay the recipient
+# never reads is a send that silently never arrives. An entry without "relays" is
+# taken to read them all. No relays.json: the one local relay, as before.
+# $NOSTR_MAILBOX_RELAY, if set, overrides all of it: that one relay, for everything.
+#
 # WHAT THE RELAY CAN SEE
 #
 # Subject and body travel NIP-44 encrypted to the recipient's key, so a message
@@ -70,7 +89,7 @@ fi
 }
 : "${MAILBOX_ROOT:=$AVATAR_ROOT/mail}"
 : "${MAILBOX_REGISTRY:=$AVATAR_ROOT/tools/nostr-mailbox/registry.json}"
-: "${NOSTR_MAILBOX_RELAY:=ws://nostr-relay:8080}"
+: "${MAILBOX_RELAYS:=$AVATAR_ROOT/tools/nostr-mailbox/relays.json}"
 
 # Every call that touches the relay is bounded by this, because nak has no timeout
 # of its own: a relay that accepts the connection and then says nothing leaves
@@ -81,6 +100,27 @@ fi
 
 die() { printf '\033[1;31mmailbox:\033[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\033[1;34mmailbox:\033[0m %s\n' "$*"; }
+warn() { printf '\033[1;33mmailbox:\033[0m %s\n' "$*" >&2; }
+
+# ──────────────────────────────────────────────────────────── relays ──────────
+# RELAY_NAMES[i] / RELAY_URLS[i], in order of preference (see WHICH RELAY above).
+RELAY_NAMES=(); RELAY_URLS=(); RELAY_SOURCE=""
+if [[ -n "${NOSTR_MAILBOX_RELAY:-}" ]]; then
+    RELAY_NAMES=( override ); RELAY_URLS=( "$NOSTR_MAILBOX_RELAY" ); RELAY_SOURCE="\$NOSTR_MAILBOX_RELAY"
+elif [[ -f "$MAILBOX_RELAYS" ]]; then
+    # A broken relays.json is a hard stop, not a fallback to the default: guessing a
+    # relay is how mail goes somewhere nobody reads.
+    jq -e '(.relays | type == "array" and length > 0)
+           and all(.relays[]; (.name | type == "string" and length > 0)
+                          and (.url | type == "string" and test("^wss?://")))
+           and ([.relays[].name] | length == (unique | length))' "$MAILBOX_RELAYS" >/dev/null 2>&1 \
+        || die "$MAILBOX_RELAYS is not a usable relay list -- it needs {\"relays\": [{\"name\", \"url\": \"ws(s)://...\"}, ...]} with distinct names"
+    while IFS=$'\t' read -r n u; do RELAY_NAMES+=( "$n" ); RELAY_URLS+=( "$u" ); done \
+        < <(jq -r '.relays[] | [.name, .url] | @tsv' "$MAILBOX_RELAYS")
+    RELAY_SOURCE="$MAILBOX_RELAYS"
+else
+    RELAY_NAMES=( local ); RELAY_URLS=( ws://nostr-relay:8080 ); RELAY_SOURCE="default (no $MAILBOX_RELAYS)"
+fi
 
 # ─────────────────────────────────────────────────────────────── nak ──────────
 # Every call to nak lives here. It is the one dependency whose interface this
@@ -114,50 +154,114 @@ nak_decrypt() { # <peer-hex> <ciphertext>
 # SIGINT rather than SIGTERM so nak closes the websocket on its way out; --kill-after
 # covers it ignoring that. timeout exits 124 when it fires, which is the one rc worth
 # naming -- every caller treats the rest as "nak failed".
-nak_relay() { # <nak args...>
-    local rc=0
-    timeout --signal=INT --kill-after=5 "$MAILBOX_RELAY_TIMEOUT" nak "$@" || rc=$?
+#
+# --auth on every relay call: a relay that demands NIP-42 sign-in (the gated relay,
+# which is what lets the fabric sit on a public address) gets it, signed with the
+# avatar's own key from $NOSTR_SECRET_KEY; a relay that never asks never sees it.
+#
+# A req never gets our stdin: see nak_sign below.
+nak_relay() { # <event|req> <nak args...> <relay-url>
+    local rc=0 verb="$1"; shift
+    if [[ "$verb" == req ]]; then
+        timeout --signal=INT --kill-after=5 "$MAILBOX_RELAY_TIMEOUT" nak req --auth "$@" </dev/null || rc=$?
+    else
+        timeout --signal=INT --kill-after=5 "$MAILBOX_RELAY_TIMEOUT" nak "$verb" --auth "$@" || rc=$?
+    fi
     (( rc == 124 )) && printf '\033[1;31mmailbox:\033[0m relay %s did not answer within %ss\n' \
-        "$NOSTR_MAILBOX_RELAY" "$MAILBOX_RELAY_TIMEOUT" >&2
+        "${*: -1}" "$MAILBOX_RELAY_TIMEOUT" >&2
     return "$rc"
 }
 
+# nak event READS STDIN whenever stdin is not a terminal: each line is taken as a
+# template and signed and published as one more event, and an open pipe that never
+# closes is waited on forever. So every signing call gets </dev/null. Without it, an
+# ack sent from inside fetch's read loop swallowed the rest of the fetched events,
+# and a send from a caller holding a pipe open waited on it until the timeout.
+nak_sign() { nak event "$@" </dev/null; }                   # <event args...> -> signed event
+
+# Signing is local and happens ONCE; only the signed event travels. So a fallback
+# relay gets the very same event, with the same id -- if the default took it after
+# all and only the answer was lost, the recipient sees one message, not two.
+#
 # Subject and from_name are no longer tags: the subject rides inside the
 # ciphertext, and the sender's name is the registry's reading of the author key.
-nak_publish() { # <ciphertext> <to-hex> [<reply-to-id>] [ack]
-    local args=( event -k "$KIND_MESSAGE" --tag "p=$2" --tag "encrypted=nip44" )
+nak_sign_message() { # <ciphertext> <to-hex> [<reply-to-id>] [ack] -> signed event
+    local args=( -k "$KIND_MESSAGE" --tag "p=$2" --tag "encrypted=nip44" )
     [[ -n "${3:-}" ]] && args+=( --tag "e=$3;;reply" )
     # Asking is a tag on the message, so the request travels with it and the
     # receiver needs no out-of-band knowledge of who wants a receipt.
     [[ "${4:-}" == ack ]] && args+=( --tag "ack=request" )
-    nak_relay "${args[@]}" -c "$1" "$NOSTR_MAILBOX_RELAY"
+    nak_sign "${args[@]}" -c "$1"
 }
 
-# Both of these reach the relay, so both go through nak_relay -- the unsend path
-# was written before that bound existed, and an unsend that hangs forever is the
-# same failure the bound was added for. Their callers already check the rc and
-# fail closed, so a 124 surfaces as "unconfirmed, rerun" rather than as success.
+nak_put() { printf '%s' "$1" | nak_relay event "$2" >/dev/null; }   # <signed-event> <relay-url>
+
+# Which of our relays a contact reads, in OUR order. A contact whose entry names no
+# relays is taken to read them all; the override is one relay for everything.
+routes_to() { # <registry-name> -> relay URLs, one per line
+    local want i
+    [[ "${RELAY_NAMES[0]}" == override ]] && { printf '%s\n' "${RELAY_URLS[@]}"; return 0; }
+    want="$(jq -r --arg n "$1" '(.[$n].relays // [])[]' "$MAILBOX_REGISTRY")"
+    for i in "${!RELAY_URLS[@]}"; do
+        [[ -z "$want" ]] || grep -qxF -- "${RELAY_NAMES[$i]}" <<<"$want" || continue
+        printf '%s\n' "${RELAY_URLS[$i]}"
+    done
+}
+
+# Default, then the next one, then the next: the first relay that takes it ends the
+# send. No broadcast -- one copy on one relay the recipient reads is delivery.
+publish_to() { # <registry-name> <signed-event> -> the URL that took it; rc 1 if none did
+    local urls url rc
+    urls="$(routes_to "$1")"
+    [[ -n "$urls" ]] || { warn "none of our relays is one $1 reads (registry.json \"relays\")"; return 1; }
+    while IFS= read -r url; do
+        rc=0; nak_put "$2" "$url" 2>/dev/null || rc=$?
+        (( rc == 0 )) && { printf '%s\n' "$url"; return 0; }
+        warn "relay $url did not take it (nak exit $rc)"
+    done <<<"$urls"
+    return 1
+}
+
+# A deletion goes to every relay, since we do not record which one took the
+# message. Its caller then asks every relay (nak_get) whether it still serves it.
 nak_delete() { # <event-id>
-    nak_relay event -k "$KIND_DELETION" --tag "e=$1" --tag "k=$KIND_MESSAGE" \
-        -c "unsent by $MAILBOX_AVATAR" "$NOSTR_MAILBOX_RELAY"
+    local ev url ok=0
+    ev="$(nak_sign -k "$KIND_DELETION" --tag "e=$1" --tag "k=$KIND_MESSAGE" -c "unsent by $MAILBOX_AVATAR")" || return 1
+    for url in "${RELAY_URLS[@]}"; do nak_put "$ev" "$url" 2>/dev/null && ok=1; done
+    (( ok ))
 }
 
-nak_get() { nak_relay req -i "$1" "$NOSTR_MAILBOX_RELAY"; } # <event-id> -> event or nothing
+# Unlike a fetch, this fails if ANY relay cannot be asked: it is the delete's proof,
+# and a relay we could not ask may still be serving the message.
+nak_get() { # <event-id> -> the event from any relay that still serves it, or nothing
+    local url
+    for url in "${RELAY_URLS[@]}"; do nak_relay req -i "$1" "$url" || return 1; done
+}
 
 # "+" is NIP-25's content for a positive reaction; the ack tag says WHICH of the
-# two facts this is. k records the kind reacted to, as NIP-25 asks.
+# two facts this is. k records the kind reacted to, as NIP-25 asks. It is routed
+# like mail: to a relay the message's author reads.
 nak_ack() { # <message-id> <message-author-hex> <delivered|read>
-    nak_relay event -k "$KIND_ACK" --tag "e=$1" --tag "p=$2" --tag "k=$KIND_MESSAGE" \
-        --tag "ack=$3" -c "+" "$NOSTR_MAILBOX_RELAY"
+    local ev
+    ev="$(nak_sign -k "$KIND_ACK" --tag "e=$1" --tag "p=$2" --tag "k=$KIND_MESSAGE" \
+        --tag "ack=$3" -c "+")" || return 1
+    publish_to "$(reg_name "$2")" "$ev" >/dev/null
 }
 
-nak_fetch_acks() { # -> one ack event JSON per line
-    nak_relay req -k "$KIND_ACK" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
+# Reads go to EVERY relay: mail waits on whichever one its sender reached. A relay
+# that cannot be read is a warning -- what it holds waits there for the next fetch --
+# and the call fails only when none could, so "no mail" never hides "no relay".
+read_all() { # <nak req args...> -> events from every relay, one per line
+    local url ok=0
+    for url in "${RELAY_URLS[@]}"; do
+        if nak_relay req "$@" "$url"; then ok=1
+        else warn "relay $url could not be read -- what it holds waits there for the next fetch"; fi
+    done
+    (( ok ))
 }
 
-nak_fetch() { # -> one event JSON per line
-    nak_relay req -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY" "$NOSTR_MAILBOX_RELAY"
-}
+nak_fetch_acks() { read_all -k "$KIND_ACK" --tag "p=$MY_PUBKEY"; }      # -> one ack event per line
+nak_fetch()      { read_all -k "$KIND_MESSAGE" --tag "p=$MY_PUBKEY"; }  # -> one event per line
 
 nak_verify() { nak verify 2>/dev/null; }                    # event JSON on stdin
 
@@ -387,7 +491,15 @@ cmd_doctor() {
             printf '  WRONG KEY: derives %s, registry says %s\n' "${derived:-<nak failed>}" "$MY_HEX"; ok=1
         fi
     fi
-    say "relay:    $NOSTR_MAILBOX_RELAY"
+    say "relays:   from $RELAY_SOURCE, in order of preference"
+    local i c
+    for i in "${!RELAY_URLS[@]}"; do printf '            %s  %s\n' "${RELAY_NAMES[$i]}" "${RELAY_URLS[$i]}"; done
+    # A contact we share no relay with is mail that can never arrive -- say so now.
+    for c in $(jq -r 'keys[]' "$MAILBOX_REGISTRY"); do
+        [[ "$c" == "$MAILBOX_AVATAR" || -n "$(routes_to "$c")" ]] && continue
+        printf '  UNREACHABLE: %s reads none of these relays (registry.json "relays": %s)\n' \
+            "$c" "$(jq -c --arg n "$c" '.[$n].relays' "$MAILBOX_REGISTRY")"; ok=1
+    done
     say "maildir:  $MAILBOX_ROOT"
     say "contacts: $(jq -r 'keys | length' "$MAILBOX_REGISTRY") in $MAILBOX_REGISTRY"
     md_init && say "maildir is writable"
@@ -510,21 +622,21 @@ cmd_send() {
     to_hex="$(jq -r --arg n "$to" '.[$n].pubkey_hex // empty' "$MAILBOX_REGISTRY")"
     [[ -n "$to_hex" ]] || die "unknown recipient $to -- not in the registry; try: mailbox contacts"
     md_init
-    local sealed ev rc=0
+    local sealed ev
     sealed="$(seal "$to_hex" "$subject" "$body")" || die "encryption failed -- nothing was sent"
-    ev="$(nak_publish "$sealed" "$to_hex" "$reply" "$ack")" || rc=$?
-    (( rc == 0 )) || die "publish failed -- nothing was sent and nothing was archived"
-    # nak exiting 0 is not proof that it published. It has been seen to exit clean
-    # having printed nothing at all, and an unchecked empty result was ARCHIVED: two
-    # empty fields make the filename "..<avatar>:2,S", a dotfile that `ls .Sent/cur`
-    # does not show, under a "sent to <avatar> ()" line with an empty id. That is the
-    # one outcome worth failing hard on -- a message the sender believes was delivered.
-    # So a send is believed only when the signed event comes back.
-    local id created
+    ev="$(nak_sign_message "$sealed" "$to_hex" "$reply" "$ack")" || die "signing failed -- nothing was sent"
+    # nak exiting 0 is not proof that it produced an event. It has been seen to exit
+    # clean having printed nothing at all, and an unchecked empty result was ARCHIVED:
+    # two empty fields make the filename "..<avatar>:2,S", a dotfile that `ls .Sent/cur`
+    # does not show, under a "sent to <avatar> ()" line with an empty id. So the
+    # signed event is checked before it goes anywhere.
+    local id created via
     id="$(jq -r '.id // empty' <<<"$ev" 2>/dev/null || true)"
     created="$(jq -r '.created_at // empty' <<<"$ev" 2>/dev/null || true)"
     [[ "$id" =~ ^[0-9a-f]{64}$ && "$created" =~ ^[0-9]+$ ]] || die \
-        "publish printed no signed event -- treat it as NOT SENT and retry; nothing was archived"
+        "signing printed no event -- treat it as NOT SENT and retry; nothing was archived"
+    # A relay's OK is the proof of sending, and nak exits non-zero without one.
+    via="$(publish_to "$to" "$ev")" || die "no relay took it -- nothing was sent and nothing was archived"
     # Only then archive, and archive the DECRYPTED copy: $ev's content is ciphertext
     # now, so writing it to .Sent would store a message its own sender cannot read.
     # Decrypting what was actually published also means a message that cannot be
@@ -532,7 +644,7 @@ cmd_send() {
     local opened
     opened="$(printf '%s' "$ev" | open_event)" || die "sent $id, but could not decrypt it back for the archive"
     printf '%s' "$opened" | render | md_deliver "$SENT" "$id" "$created" "S" cur >/dev/null
-    say "sent to $to  ($id)"
+    say "sent to $to  ($id)  via $via"
 }
 
 cmd_reply() {
@@ -583,6 +695,6 @@ case "${1:-doctor}" in
     send)     shift; cmd_send "$@" ;;
     reply)    shift; cmd_reply "$@" ;;
     delete)   shift; cmd_delete "$@" ;;
-    -h|--help|help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help|help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
     *) die "unknown command '$1' (doctor|contacts|fetch|list|read|send|reply|delete)" ;;
 esac
