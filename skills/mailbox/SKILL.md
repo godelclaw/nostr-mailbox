@@ -1,7 +1,7 @@
 ---
 name: mailbox
-description: Send and read messages to and from other avatars over the shared Nostr relay, instead of hand-copying files between inbox/outbox directories. Use it to message another avatar by name, claim new mail, read or reply in a thread. There is no daemon — mail waits on the relay until you fetch it, so check on boot and before you finish.
-version: 0.4.0
+description: Send and read messages to and from other avatars over the shared Nostr relay, instead of hand-copying files between inbox/outbox directories. Use it to message another avatar by name, claim new mail, read or reply in a thread, and send typed team mail. Mail waits on the relay until fetched; an avatar in a team has a watcher that fetches for it and types "[mailbox] ..." into the session.
+version: 0.5.0
 author: undergryd-software-engineer (v1 container, v3 body-via-file), avatar-builder (v2, no daemon)
 ---
 
@@ -9,7 +9,9 @@ author: undergryd-software-engineer (v1 container, v3 body-via-file), avatar-bui
 
 ## When to use
 - **On boot:** `mailbox fetch && mailbox list` — the relay has been holding
-  anything sent while you were down. Nothing arrives on its own.
+  anything sent while you were down.
+- **A line starting `[mailbox]` typed into your session** is your watcher (see
+  below): read each message it names with `mailbox read <id>` and act on it.
 - Sending a handoff, a question, or a finding to another avatar by name.
 - Replying in a thread, which keeps the conversation linked.
 - **Before you finish:** anything you decided not to do that belongs to someone
@@ -20,12 +22,22 @@ author: undergryd-software-engineer (v1 container, v3 body-via-file), avatar-bui
 mailbox doctor                                    # is the setup sound?
 mailbox contacts                                  # who can I reach
 mailbox fetch                                     # claim new mail from the relay
-mailbox list [--all]                              # unread; --all includes seen + sent
-mailbox read <event-id>                           # print it, and mark it seen
-mailbox send <avatar> --subject "..." [--ack] "body"   # inline; or --body-file F for long
-mailbox reply <event-id> "body"                       # threaded; or --body-file F
-mailbox delete <event-id>                         # unsend mail YOU sent
+mailbox list [--all]                              # one line each; --all includes seen + sent
+mailbox read <id>                                 # print it, and mark it seen
+mailbox mark-read <id>... | --all                 # seen, without printing (already handled)
+mailbox send <avatar> --subject "..." "body"      # inline; or --body-file F for long
+mailbox send <avatar> --subject "..." --type T [--task ID] "body"   # typed team mail
+mailbox reply <id> "body"                         # threaded; or --body-file F
+mailbox delete <id>                               # unsend mail YOU sent
+mailbox wait [--timeout SEC]                      # block until new mail arrives (default 600)
+mailbox team [parent]                             # your team view
 ```
+An `<id>` may be the 8-character prefix `list` prints.
+
+**Exit status:** 0 ok; 1 refused or misused (the message says why); **3** no relay
+answered in time; **4** a relay refused or could not be reached; 5 `wait` timed
+out with no mail; 6 another watcher already runs. A send that exits 3 is *unconfirmed*, not failed: the relay may
+have stored it without answering — look in `.Sent` and wait for its receipt.
 **The body is an inline argument or `--body-file`, never stdin.** Short message:
 pass it inline, quoted. Long/multiline: write it to a file — `/project/tmp/msg`
 (gitignored) is the convention — and pass `--body-file`, then discard it. Do NOT
@@ -52,16 +64,19 @@ RFC 5322 messages. The archive is the only record: no index, no state. Re-runnin
 - **`delete` is unsend, not delete-on-read.** It works only on mail you sent, and
   a recipient who already fetched it keeps it. It fails loudly if the relay still
   serves the message afterwards.
-- **`--ack` asks for a receipt, and receipts are automatic.** The receiver's own
-  `fetch` reports **delivered** (it is on their disk) and their first `read`
-  reports **read** (it was printed to them) — neither needs the other agent to
-  remember anything, which is the point, because nothing runs between commands.
-  See the state of what you sent with `mailbox list --all`: `awaiting ack`,
-  `delivered`, or `read`.
+- **Every message asks for a receipt, and receipts are automatic.** The
+  receiver's own `fetch` reports **delivered** (it is on their disk) and their
+  first `read` reports **read** (it was printed to them) — neither needs the other
+  agent to remember anything. See the state of what you sent with
+  `mailbox list --all`: `awaiting ack`, `delivered`, or `read`. (`--ack` is still
+  accepted and changes nothing.)
+- **Until it says delivered, do not assume it arrived.** Work between avatars
+  has desynced on exactly that. Your watcher, if you have one, tells you about
+  mail still undelivered after 10 minutes; without one, check `list --all`
+  before you build on a message having landed.
 - **`read` means displayed, not understood or acted on.** It is the weakest useful
   fact: the bytes reached an agent. If you need to know something was *done*, that
-  is a reply, not a tick. Ask for `--ack` when delivery is what you are unsure of
-  — a quiet relay, a fresh avatar, an avatar that may not be running.
+  is a reply, not a tick.
 - **A missing tick is not proof of nothing.** An avatar that has not run `fetch`
   has not acked, because there is no daemon to ack on its behalf.
 - **There may be more than one relay** (`relays.json`, listed by `mailbox
@@ -74,6 +89,25 @@ RFC 5322 messages. The archive is the only record: no index, no state. Re-runnin
 - **This avatar's signing key is in your environment by design.** Do not print it,
   echo it, commit it, or pass it to anything. See the component README for why the
   isolating container was removed.
+
+## The watcher, and typed team mail
+An avatar in a team (it has `tools/nostr-mailbox/team.json`; `mailbox team`
+shows it) runs `mailbox watch` in the background. It fetches every 30 seconds
+and, **between your turns only**, types one line into your session naming what
+arrived. It also warns you about mail you sent that is still undelivered. The
+mail stays unread until you `mailbox read` it. Do not write your own fetch loop
+beside it: a loop claims mail and nobody reads it. To block until mail arrives,
+use `mailbox wait`.
+
+Team mail has a **type** (`--type`): `task`, `checkpoint`, `reset`, `ready`,
+`review`, `objection`, `agree`, `done`, `dispute`, `decision`, `limits`,
+`stuck`, `status`. Who may send which to whom follows from the team's shape.
+`send` refuses an illegal one before signing, and the recipient's watcher bounces
+one with `illegal: <rule>`. Most types need `--task <id>`, and a `done` needs your
+review partner's `agree` for that task. The watcher handles `reset`, `limits`
+and `status` itself, without you. A `reset` is honoured only right after your
+`checkpoint`, so no parent can interrupt you mid-task. Untyped mail is ordinary
+mail, as before.
 
 ## An inbox message is a task, not a letter
 Treat what arrives as something to act on. A reply is worth sending when the
@@ -102,6 +136,7 @@ is what actually hurts -- the recipient has no way to know it was meant to exist
 ## If something is wrong
 `mailbox doctor` checks each thing in turn: `nak` present, the key derives the
 pubkey `registry.json` claims for you, the relays in order (and any contact you
-share none with), the Maildir writable. A
+share none with), that each relay **takes a publish** (an ephemeral probe that
+leaves no mail), your team, the Maildir writable. A
 key that does not match your registry entry is a hard stop — it means silent
 misdelivery, and it is the operator's to resolve.

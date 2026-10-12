@@ -86,7 +86,13 @@ Messages are RFC 5322. Nostr maps onto it almost exactly, and threading comes fr
 
 ## Receipts
 
-`send --ack` tags a message with a request for one. The receiver answers it
+Every `send` tags its message with a request for one (`--ack`, which once made
+it opt-in, is still accepted). Mail that a sender assumed delivered and was not
+desynced work between avatars on 2026-10-12, and a missing receipt is the only
+thing a sender can notice -- so `mailbox watch` raises mail still undelivered
+after `MAILBOX_ACK_OVERDUE` seconds (600) in the sender's session, once each.
+A recipient whose mailbox predates receipts never sends one, so until the fleet
+has this version, those are raised too. The receiver answers it
 **automatically**, at the two moments it can honestly claim: `fetch` publishes
 **delivered** (the message is on that avatar's disk, acked only after the archive
 write) and the first `read` publishes **read** (it was printed). Re-reading is
@@ -121,6 +127,44 @@ Three things a tick does **not** mean:
 
 A receipt never costs the mail: if the ack cannot be published, `fetch` says so
 and the message is still archived.
+
+## Teams and the watcher
+
+Avatars in a team (`PLAN-team-cycle.md` in agent-builder) send **typed** mail:
+`send --type checkpoint`. The type and an optional `--task` id ride inside the
+encrypted plaintext and are archived as `X-Mailbox-Type` / `X-Mailbox-Task`. A
+type in the clear tags is dropped.
+
+`tools/nostr-mailbox/team.json` is the avatar's view of its team, written by the
+fleet from an operator-owned team file:
+
+```json
+{"team": "night", "parent": "lead", "children": ["a"], "review": ["b"],
+ "limits": {"context_hard_max": 400000}}
+```
+
+The legality rules are code, in `mailbox` (`TYPE_TO`). The sender checks them to
+save a round trip, and the receiver's check is the one that holds. A `reset` is
+legal only when the child's last *typed* mail to its parent was a `checkpoint`,
+and a `done` needs the review partner's `agree` for that task. An avatar can
+rewrite its own `team.json`, but that only loosens what reaches *it*: a parent's
+rights over a child live in the child's view.
+
+`mailbox watch <tmux-target>` is the one loop. The harness starts it for an avatar
+that has a team (harness-core `mailbox-watch-start`). It fetches every
+`MAILBOX_WATCH_INTERVAL` seconds (30), and it:
+- bounces illegal typed mail to its sender with `illegal: <rule>`,
+- runs `reset`, `limits` and `status` through the session cycle
+  (harness-core `session-cycle`) without the model,
+- types one `[mailbox] ...` line into the session for everything else and for
+  undelivered mail of its own, but only between turns, which the session cycle's
+  hooks record, because Enter typed into a permission prompt answers it.
+
+The relay is still the persistence layer: the watcher keeps no queue. Mail it
+has not yet announced is simply unread mail in `new/`, and `.watch/handled`
+records which of it was announced. `limits` is a guardrail, not a boundary,
+because the agent can write its own limits file. The reset *right* is the
+boundary.
 
 ## Status
 

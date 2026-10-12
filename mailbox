@@ -4,12 +4,22 @@
 #   mailbox doctor                              check the setup before trusting it
 #   mailbox contacts                            who can I reach (registry.json)
 #   mailbox fetch                               claim new mail from the relay
-#   mailbox list [--all]                        unread (default) or everything
-#   mailbox read <event-id>                     print it; marks it seen
-#   mailbox send <avatar> --subject S [--ack] [--body-file F | body]  sign + publish
-#   mailbox reply <event-id> [--body-file F | body]           threaded reply
-#   mailbox delete <event-id>                   unsend mail YOU sent (NIP-09)
+#   mailbox list [--all]                        unread (default) or everything, one line each
+#   mailbox read <id>                           print it; marks it seen
+#   mailbox mark-read <id>... | --all           mark handled mail seen without printing it
+#   mailbox send <avatar> --subject S [--type T [--task ID]] [--body-file F | body]
+#   mailbox reply <id> [--body-file F | body]   threaded reply
+#   mailbox delete <id>                         unsend mail YOU sent (NIP-09)
 #   mailbox list --all                          ... and the ack state of what you sent
+#   mailbox wait [--timeout SEC]                fetch until new mail arrives; print it
+#   mailbox watch <tmux-target>                 the watcher: fetch, wake the session, run control mail
+#   mailbox team [parent]                       this avatar's team view, or just its parent
+#
+# An <id> may be its first 8+ characters, as `list` prints it.
+#
+# EXIT STATUS: 0 ok; 1 refused or misused (the message says which); 3 a relay did
+# not answer in time; 4 a relay refused or could not be reached; 5 `wait` saw no
+# mail before its timeout; 6 `watch` found another watcher running for this avatar.
 #
 # WHICH RELAY
 #
@@ -71,6 +81,12 @@ KIND_DELETION=5
 # kind also means the relay needed no change: ours gates on pubkeys, not kinds.
 KIND_ACK=7
 NIP44_MAX=65535   # NIP-44 plaintext limit, in bytes; nak does not enforce it
+# Ephemeral (NIP-16: 20000-29999): a relay acknowledges it and never stores it, so
+# doctor can prove a publish without leaving mail anywhere. Probed against
+# nostr-rs-relay 2026-10-12: OK returned, nothing served afterwards.
+KIND_PROBE=23838
+
+RC_TIMEOUT=3; RC_REFUSED=4; RC_NO_MAIL=5; RC_LOCKED=6
 
 : "${AVATAR_ROOT:=/project}"
 
@@ -90,6 +106,9 @@ fi
 : "${MAILBOX_ROOT:=$AVATAR_ROOT/mail}"
 : "${MAILBOX_REGISTRY:=$AVATAR_ROOT/tools/nostr-mailbox/registry.json}"
 : "${MAILBOX_RELAYS:=$AVATAR_ROOT/tools/nostr-mailbox/relays.json}"
+# This avatar's view of its team, written by the fleet (see TEAMS below). No file:
+# no team, and typed mail is refused.
+: "${MAILBOX_TEAM:=$AVATAR_ROOT/tools/nostr-mailbox/team.json}"
 
 # Every call that touches the relay is bounded by this, because nak has no timeout
 # of its own: a relay that accepts the connection and then says nothing leaves
@@ -99,6 +118,7 @@ fi
 : "${MAILBOX_RELAY_TIMEOUT:=20}"
 
 die() { printf '\033[1;31mmailbox:\033[0m %s\n' "$*" >&2; exit 1; }
+die_rc() { local rc="$1"; shift; printf '\033[1;31mmailbox:\033[0m %s\n' "$*" >&2; exit "$rc"; }
 say() { printf '\033[1;34mmailbox:\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33mmailbox:\033[0m %s\n' "$*" >&2; }
 
@@ -210,16 +230,19 @@ routes_to() { # <registry-name> -> relay URLs, one per line
 
 # Default, then the next one, then the next: the first relay that takes it ends the
 # send. No broadcast -- one copy on one relay the recipient reads is delivery.
-publish_to() { # <registry-name> <signed-event> -> the URL that took it; rc 1 if none did
-    local urls url rc
+publish_to() { # <registry-name> <signed-event> -> the URL that took it
+    # rc: RC_TIMEOUT if every relay timed out, RC_REFUSED if any refused or was
+    # unreachable, 1 if none of ours is one the contact reads.
+    local urls url rc out="$RC_TIMEOUT"
     urls="$(routes_to "$1")"
     [[ -n "$urls" ]] || { warn "none of our relays is one $1 reads (registry.json \"relays\")"; return 1; }
     while IFS= read -r url; do
         rc=0; nak_put "$2" "$url" 2>/dev/null || rc=$?
         (( rc == 0 )) && { printf '%s\n' "$url"; return 0; }
-        warn "relay $url did not take it (nak exit $rc)"
+        if (( rc == 124 )); then warn "relay $url did not answer within ${MAILBOX_RELAY_TIMEOUT}s"
+        else warn "relay $url refused it or could not be reached (nak exit $rc)"; out="$RC_REFUSED"; fi
     done <<<"$urls"
-    return 1
+    return "$out"
 }
 
 # A deletion goes to every relay, since we do not record which one took the
@@ -252,12 +275,14 @@ nak_ack() { # <message-id> <message-author-hex> <delivered|read>
 # that cannot be read is a warning -- what it holds waits there for the next fetch --
 # and the call fails only when none could, so "no mail" never hides "no relay".
 read_all() { # <nak req args...> -> events from every relay, one per line
-    local url ok=0
+    local url ok=0 rc out="$RC_TIMEOUT"
     for url in "${RELAY_URLS[@]}"; do
-        if nak_relay req "$@" "$url"; then ok=1
-        else warn "relay $url could not be read -- what it holds waits there for the next fetch"; fi
+        rc=0; nak_relay req "$@" "$url" || rc=$?
+        if (( rc == 0 )); then ok=1; continue; fi
+        (( rc == 124 )) || out="$RC_REFUSED"
+        warn "relay $url could not be read -- what it holds waits there for the next fetch"
     done
-    (( ok ))
+    (( ok )) || return "$out"
 }
 
 nak_fetch_acks() { read_all -k "$KIND_ACK" --tag "p=$MY_PUBKEY"; }      # -> one ack event per line
@@ -274,6 +299,118 @@ reg_name() { jq -r --arg k "$1" 'to_entries[] | select(.value.pubkey_hex==$k) | 
 MY_HEX="$(jq -r --arg n "$MAILBOX_AVATAR" '.[$n].pubkey_hex // empty' "$MAILBOX_REGISTRY")"
 [[ -n "$MY_HEX" ]] || die "$MAILBOX_AVATAR has no entry in $MAILBOX_REGISTRY"
 MY_PUBKEY="$MY_HEX"
+
+# ─────────────────────────────────────────────────────────── teams ────────────
+# TEAMS. Avatars in a team send each other TYPED mail: `send --type checkpoint`.
+# Who may send which type to whom follows from the team's shape -- parent,
+# children, review partners -- and that shape is configuration: team.json is this
+# avatar's own view of it, written by the fleet from an operator-owned team file.
+#
+#   {"team": "night", "parent": "lead" | null, "children": ["a", "b"],
+#    "review": ["b"], "limits": {"context_hard_max": 400000, ...}}
+#
+# The rules are code, versioned with this script. TYPE_TO says what the recipient
+# must be to the sender; the receiver checks the mirror image, and that check is
+# the one that holds -- a sender's check only saves it a bounce. Untyped mail is
+# ordinary mail, between any two avatars in the registry, as it always was.
+#
+# team.json is in the avatar's own tree, so an avatar can rewrite its own view.
+# That only loosens what reaches IT; a parent's rights over a child live in the
+# child's view, and the operator's file is the source both are published from.
+declare -A TYPE_TO=(
+    [task]=child [reset]=child [limits]=child [decision]=child
+    [checkpoint]=parent [ready]=parent [done]=parent [dispute]=parent [stuck]=parent
+    [review]=peer [objection]=peer [agree]=peer
+    [status]=any
+)
+TYPES_WITH_TASK=" task review objection agree done dispute decision "
+
+team_has() { [[ -f "$MAILBOX_TEAM" ]]; }
+team_get() { jq -r "$1 // empty" "$MAILBOX_TEAM" 2>/dev/null; }   # <jq path>
+
+# What <other> is to this avatar: parent, child, peer (a review partner) or none.
+relation() { # <avatar>
+    team_has || { echo none; return; }
+    jq -r --arg o "$1" '
+        if .parent == $o then "parent"
+        elif ((.children // []) | index($o)) then "child"
+        elif ((.review // []) | index($o)) then "peer"
+        else "none" end' "$MAILBOX_TEAM" 2>/dev/null || echo none
+}
+
+mirror() { case "$1" in parent) echo child ;; child) echo parent ;; *) echo "$1" ;; esac; }
+
+# The headers of an archived message, without its body -- a body may quote one.
+headers_of() { sed '/^$/q' "$1"; }
+has_header() { headers_of "$1" | grep -qxF -- "$2"; }   # <file> <exact line>
+
+# The type of the newest TYPED mail this avatar sent to <to>, or nothing. Untyped
+# mail does not count: it is chatter, a watcher's bounce or a status answer, and a
+# parent asking for status must not void the checkpoint its child is waiting on.
+last_sent_type() { # <to>
+    local f t
+    while IFS= read -r f; do
+        [[ "$(hdr "$f" To | cut -d' ' -f1)" == "$1" ]] || continue
+        t="$(hdr "$f" X-Mailbox-Type)"
+        [[ -n "$t" ]] && { printf '%s\n' "$t"; return 0; }
+    done < <(find "$SENT/cur" -type f 2>/dev/null | sort -r)
+}
+
+received() { # <type> <task> -- has this avatar been sent one, by a review partner?
+    local f
+    while IFS= read -r f; do
+        has_header "$f" "X-Mailbox-Task: $2" || continue
+        [[ "$(relation "$(hdr "$f" From | cut -d' ' -f1)")" == peer ]] && return 0
+    done < <(grep -lxF -- "X-Mailbox-Type: $1" "$INBOX"/new/* "$INBOX"/cur/* 2>/dev/null)
+    return 1
+}
+
+# Both checks print the broken rule and fail; legal is silent.
+illegal_shape() { # <type> <task>
+    [[ -n "${TYPE_TO[$1]:-}" ]] || { echo "unknown type '$1' (known: ${!TYPE_TO[*]})"; return 0; }
+    [[ "$TYPES_WITH_TASK" == *" $1 "* && -z "$2" ]] && { echo "a $1 needs a task id (--task)"; return 0; }
+    return 1
+}
+
+illegal_out() { # <to> <type> <task>
+    local want rel
+    illegal_shape "$2" "$3" && return 0
+    team_has || { echo "this avatar has no team ($MAILBOX_TEAM): typed mail is for teams"; return 0; }
+    want="${TYPE_TO[$2]}"; rel="$(relation "$1")"
+    if [[ "$want" == any ]]; then
+        [[ "$rel" != none ]] || { echo "$1 is not in this avatar's team"; return 0; }
+    elif [[ "$rel" != "$want" ]]; then
+        echo "a $2 goes to your $want; $1 is your $rel"; return 0
+    fi
+    [[ "$2" == done ]] && ! received agree "$3" && { echo "a done needs an agree for task $3 from your review partner"; return 0; }
+    return 1
+}
+
+illegal_in() { # <from> <type> <task>
+    local want rel
+    illegal_shape "$2" "$3" && return 0
+    team_has || { echo "$MAILBOX_AVATAR has no team: typed mail is for teams"; return 0; }
+    want="${TYPE_TO[$2]}"; rel="$(relation "$1")"
+    if [[ "$want" == any ]]; then
+        [[ "$rel" != none ]] || { echo "$1 is not in $MAILBOX_AVATAR's team"; return 0; }
+    elif [[ "$rel" != "$(mirror "$want")" ]]; then
+        echo "a $2 comes from a $(mirror "$want"); to $MAILBOX_AVATAR, $1 is a $rel"; return 0
+    fi
+    # The task cycle is the child's to keep: a parent cannot reset it mid-task.
+    [[ "$2" == reset && "$(last_sent_type "$1")" != checkpoint ]] \
+        && { echo "a reset answers a checkpoint, and $MAILBOX_AVATAR's last mail to $1 was not one"; return 0; }
+    return 1
+}
+
+cmd_team() {
+    # `team parent` is for scripts: no team and no parent both print nothing.
+    team_has || { [[ "${1:-}" == parent ]] || echo "no team ($MAILBOX_TEAM)"; return 0; }
+    case "${1:-}" in
+        parent) team_get .parent ;;
+        "")     jq . "$MAILBOX_TEAM" ;;
+        *)      die "usage: mailbox team [parent]" ;;
+    esac
+}
 
 # ──────────────────────────────────────────────────────── maildir ─────────────
 INBOX="$MAILBOX_ROOT"
@@ -306,7 +443,16 @@ md_deliver() { # <folder> <event-id> <created_at> <flags> <new|cur> ; message on
     printf '%s\n' "$folder/${5:-new}/$name"
 }
 
-md_find() { find "$INBOX/new" "$INBOX/cur" -type f -name "*.$1.*" 2>/dev/null | head -1; }
+# An id or the start of one; a prefix that names two messages names none. Matched
+# against the id field of the name (<created>.<id>.<avatar>), nothing else.
+md_find() { # <id-or-prefix> -> the received message's path, or nothing
+    local hits
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || return 0
+    hits="$(find "$INBOX/new" "$INBOX/cur" -type f -name "*.$1*" 2>/dev/null \
+            | grep -E "/[0-9]+\.$1[^./]*\.[^/]*$" || true)"
+    (( $(grep -c . <<<"$hits") <= 1 )) || { warn "id $1 matches more than one message -- give more of it"; return 0; }
+    printf '%s' "$hits"
+}
 
 # Seen is a rename, not a database write: new/<name> -> cur/<name>:2,S
 md_mark_seen() {
@@ -390,8 +536,14 @@ ack_claim() { # -> count on stdout
 # ─────────────────────────────────────────────────────── envelope ─────────────
 # seal: subject + body -> NIP-44 ciphertext for one recipient. The plaintext is a
 # small JSON object so the subject is hidden along with the body.
-seal() { # <to-hex> <subject> <body>
-    local pt; pt="$(jq -nc --arg s "$2" --arg b "$3" '{subject: $s, body: $b}')"
+#
+# A team message's type and task id ride in the same object, not in tags: what a
+# message IS ("reset", "objection") is as much its content as its subject is.
+# A mailbox older than this one opens it and simply ignores the two fields.
+seal() { # <to-hex> <subject> <body> [<type> [<task>]]
+    local pt; pt="$(jq -nc --arg s "$2" --arg b "$3" --arg t "${4:-}" --arg k "${5:-}" \
+        '{subject: $s, body: $b} + (if $t != "" then {type: $t} else {} end)
+                                 + (if $k != "" then {task: $k} else {} end)')"
     (( $(printf '%s' "$pt" | wc -c) <= NIP44_MAX )) \
         || die "refusing to send: the message is over NIP-44's $NIP44_MAX-byte limit -- share the file and send its location"
     nak_encrypt "$1" "$pt"
@@ -403,6 +555,9 @@ seal() { # <to-hex> <subject> <body>
 # event (sent by a mailbox older than this one) passes through unchanged.
 open_event() { # event JSON on stdin -> event JSON on stdout; fails if it cannot decrypt
     local ev peer pt; ev="$(cat)"
+    # A type or task only ever comes from inside the ciphertext. One in the clear
+    # tags would be an older or a forged sender's, and is dropped.
+    ev="$(jq -c '.tags |= map(select(.[0] != "type" and .[0] != "task"))' <<<"$ev")"
     if ! jq -e '.tags[] | select(.[0]=="encrypted" and .[1]=="nip44")' <<<"$ev" >/dev/null; then
         printf '%s' "$ev"; return 0
     fi
@@ -410,7 +565,9 @@ open_event() { # event JSON on stdin -> event JSON on stdout; fails if it cannot
     [[ "$peer" == "$MY_HEX" ]] && peer="$(jq -r '(.tags[] | select(.[0]=="p") | .[1]) // ""' <<<"$ev" | head -1)"
     pt="$(nak_decrypt "$peer" "$(jq -r '.content' <<<"$ev")" 2>/dev/null)" || return 1
     jq -e 'has("subject") and has("body")' <<<"$pt" >/dev/null 2>&1 || return 1
-    jq -c --argjson pt "$pt" '.content = $pt.body | .tags += [["subject", $pt.subject]]' <<<"$ev"
+    jq -c --argjson pt "$pt" '.content = $pt.body | .tags += [["subject", $pt.subject]]
+        | if ($pt.type | type) == "string" then .tags += [["type", $pt.type]] else . end
+        | if ($pt.task | type) == "string" then .tags += [["task", $pt.task]] else . end' <<<"$ev"
 }
 
 # ────────────────────────────────────────────────────── rfc 5322 ──────────────
@@ -441,6 +598,13 @@ render() { # event JSON on stdin -> RFC 5322 on stdout
     printf 'To: %s <%s@nostr>\n' "$to_name" "$(reg_npub "$to_name")"
     printf 'Subject: %s\n' "$subject"
     [[ -n "$reply_to" ]] && printf 'In-Reply-To: <%s@nostr>\n' "$reply_to"
+    # Headers, so the archive -- the only record -- says what a team message is.
+    # Newlines are stripped: a value that could start a header could forge one.
+    local mtype mtask
+    mtype=$(jq -r '(.tags[] | select(.[0]=="type") | .[1]) // ""' <<<"$ev" | head -1 | tr -d '\r\n')
+    mtask=$(jq -r '(.tags[] | select(.[0]=="task") | .[1]) // ""' <<<"$ev" | head -1 | tr -d '\r\n')
+    [[ -n "$mtype" ]] && printf 'X-Mailbox-Type: %s\n' "$mtype"
+    [[ -n "$mtask" ]] && printf 'X-Mailbox-Task: %s\n' "$mtask"
     printf 'X-Nostr-Event-Id: %s\n' "$id"
     printf 'X-Nostr-Pubkey: %s\n' "$from_hex"
     printf 'X-Nostr-Kind: %s\n' "$(jq -r '.kind' <<<"$ev")"
@@ -500,6 +664,23 @@ cmd_doctor() {
         printf '  UNREACHABLE: %s reads none of these relays (registry.json "relays": %s)\n' \
             "$c" "$(jq -c --arg n "$c" '.[$n].relays' "$MAILBOX_REGISTRY")"; ok=1
     done
+    # Reading and writing fail separately -- a relay that serves fetches can still
+    # stall every publish -- so doctor proves a write too. The probe is ephemeral:
+    # acknowledged, never stored, so it leaves no mail behind.
+    if [[ -n "${NOSTR_MAILBOX_NSEC:-}" ]] && command -v nak >/dev/null; then
+        local probe rc
+        probe="$(nak_sign -k "$KIND_PROBE" -c "mailbox doctor probe" 2>/dev/null)" || probe=""
+        for i in "${!RELAY_URLS[@]}"; do
+            [[ -n "$probe" ]] || { printf '  BROKEN: could not sign a probe event\n'; ok=1; break; }
+            rc=0; nak_put "$probe" "${RELAY_URLS[$i]}" 2>/dev/null || rc=$?
+            if (( rc == 0 )); then say "publish:  ${RELAY_NAMES[$i]} took a probe"
+            elif (( rc == 124 )); then printf '  NO PUBLISH: %s did not answer within %ss\n' "${RELAY_NAMES[$i]}" "$MAILBOX_RELAY_TIMEOUT"; ok=1
+            else printf '  NO PUBLISH: %s refused the probe or could not be reached (nak exit %s)\n' "${RELAY_NAMES[$i]}" "$rc"; ok=1; fi
+        done
+    fi
+    if team_has; then
+        say "team:     $(team_get .team) -- parent $(team_get .parent | grep . || echo none), children $(team_get '.children | join(", ")' | grep . || echo none)"
+    fi
     say "maildir:  $MAILBOX_ROOT"
     say "contacts: $(jq -r 'keys | length' "$MAILBOX_REGISTRY") in $MAILBOX_REGISTRY"
     md_init && say "maildir is writable"
@@ -519,7 +700,8 @@ cmd_fetch() {
     nak_fetch > "$raw" || rc=$?
     if (( rc != 0 )); then
         rm -f "$raw"
-        die "fetch failed (nak exit $rc) -- nothing was claimed and the maildir is unchanged"
+        (( rc == RC_TIMEOUT )) && die_rc "$rc" "fetch failed: no relay answered within ${MAILBOX_RELAY_TIMEOUT}s -- nothing was claimed and the maildir is unchanged"
+        die_rc "$RC_REFUSED" "fetch failed: no relay could be read -- nothing was claimed and the maildir is unchanged"
     fi
 
     local n=0 dup=0 bad=0 ev id created opened
@@ -549,26 +731,51 @@ cmd_fetch() {
     say "claimed $n new, skipped $dup already held$( ((bad)) && printf ', REJECTED %d unverified' "$bad")$( (( acked )) && printf ', %d ack(s) for mail you sent' "$acked")"
 }
 
+list_line() { # <archived file> -> one line: state, short id, who, [type], subject
+    local f="$1" id state label who type
+    id="$(hdr "$f" X-Nostr-Event-Id)"
+    # For mail WE sent, the useful state is not whether we have read it -- we
+    # wrote it -- but whether the other end has. An asked-for ack that has
+    # not come back is worth seeing as "sent", not as silence.
+    if [[ "$f" == */.Sent/* ]]; then
+        state="$(ack_state "$id")"
+        if [[ -n "$state" ]]; then label="$state"
+        elif [[ "$(hdr "$f" X-Nostr-Ack-Request)" == yes ]]; then label="awaiting ack"
+        else label="sent"; fi
+        who="to $(hdr "$f" To | cut -d' ' -f1)"
+    else
+        if [[ "$f" == */new/* ]]; then label=unread
+        elif [[ "${f##*:2,}" == *T* ]]; then label=refused    # bounced by the watcher
+        else label=seen; fi
+        who="$(hdr "$f" From | cut -d' ' -f1)"
+    fi
+    type="$(hdr "$f" X-Mailbox-Type)"
+    printf '  %-12s %s  %-30s %s%s\n' "$label" "${id:0:8}" "$who" "${type:+[$type] }" "$(hdr "$f" Subject)"
+}
+
 cmd_list() {
-    local dirs=("$INBOX/new")
-    [[ "${1:-}" == "--all" ]] && dirs+=("$INBOX/cur" "$SENT/cur")
-    local f id state label
-    find "${dirs[@]}" -type f 2>/dev/null | sort -r | while read -r f; do
-        id="$(hdr "$f" X-Nostr-Event-Id)"
-        # For mail WE sent, the useful state is not whether we have read it -- we
-        # wrote it -- but whether the other end has. An asked-for ack that has
-        # not come back is worth seeing as "sent", not as silence.
-        if [[ "$f" == */.Sent/* ]]; then
-            state="$(ack_state "$id")"
-            if [[ -n "$state" ]]; then label="$state"
-            elif [[ "$(hdr "$f" X-Nostr-Ack-Request)" == yes ]]; then label="awaiting ack"
-            else label="sent"; fi
-        else
-            label="$([[ "$f" == */new/* ]] && echo unread || echo seen)"
-        fi
-        printf '  %-13s %-28s %s\n' "$label" "$(hdr "$f" From | cut -d' ' -f1)" "$(hdr "$f" Subject)"
-        printf '  %-13s %s\n' '' "$id"
-    done
+    local dirs=("$INBOX/new") all=0 f n=0
+    [[ "${1:-}" == "--all" ]] && { dirs+=("$INBOX/cur" "$SENT/cur"); all=1; }
+    while read -r f; do list_line "$f"; n=$((n+1)); done \
+        < <(find "${dirs[@]}" -type f 2>/dev/null | sort -r)
+    (( n )) || { (( all )) && echo "  no mail" || echo "  0 unread"; }
+    return 0
+}
+
+# Seen, without printing it and without a read receipt: for mail already handled
+# some other way. A receipt says the bytes were shown, and these were not.
+cmd_mark_read() {
+    local id f n=0
+    if [[ "${1:-}" == --all ]]; then
+        for f in "$INBOX"/new/*; do [[ -f "$f" ]] && md_mark_seen "$f" && n=$((n+1)); done
+    else
+        [[ $# -ge 1 ]] || die "usage: mailbox mark-read <id>... | --all"
+        for id in "$@"; do
+            f="$(md_find "$id")"; [[ -n "$f" ]] || die "no message with id $id (marked $n)"
+            md_mark_seen "$f"; n=$((n+1))
+        done
+    fi
+    say "marked $n seen"
 }
 
 cmd_read() {
@@ -593,18 +800,36 @@ cmd_read() {
 }
 
 cmd_send() {
-    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S [--ack] [--body-file F | <inline body>]"
+    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S [--type T [--task ID]] [--body-file F | <inline body>]"
     local to="$1"; shift
-    local subject="" reply="" body_file="" ack=""
+    # Every message asks for receipts. Mail assumed delivered that was not is how
+    # work between avatars desynced on 2026-10-12; a missing receipt is the only
+    # thing a sender can notice, and the watcher says so (ack_overdue). --ack is
+    # accepted for the callers that still pass it.
+    local subject="" reply="" body_file="" ack=ack type="" task=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
-            --subject)   subject="$2"; shift 2 ;;
-            --reply)     reply="$2"; shift 2 ;;
-            --ack)       ack=ack; shift ;;
-            --body-file) body_file="$2"; shift 2 ;;
+            --subject|--reply|--body-file|--type|--task)
+                [[ $# -ge 2 ]] || die "$1 needs a value"
+                case "$1" in
+                    --subject)   subject="$2" ;;
+                    --reply)     reply="$2" ;;
+                    --body-file) body_file="$2" ;;
+                    --type)      type="$2" ;;
+                    --task)      task="$2" ;;
+                esac
+                shift 2 ;;
+            --ack)       shift ;;
             *)           break ;;
         esac
     done
+    [[ -z "$task" || -n "$type" ]] || die "--task goes with --type"
+    [[ "$task" =~ ^[A-Za-z0-9._:/-]{0,64}$ ]] || die "a task id is up to 64 of: letters, digits and . _ : / -"
+    # Refused here, before anything is signed: the recipient's watcher would only
+    # bounce it, and a bounce costs a round trip.
+    if [[ -n "$type" ]]; then
+        local why; if why="$(illegal_out "$to" "$type" "$task")"; then die "refusing to send: $why"; fi
+    fi
     # Body from --body-file OR one inline argument, never both, never stdin.
     local body
     if [[ -n "$body_file" ]]; then
@@ -623,7 +848,7 @@ cmd_send() {
     [[ -n "$to_hex" ]] || die "unknown recipient $to -- not in the registry; try: mailbox contacts"
     md_init
     local sealed ev
-    sealed="$(seal "$to_hex" "$subject" "$body")" || die "encryption failed -- nothing was sent"
+    sealed="$(seal "$to_hex" "$subject" "$body" "$type" "$task")" || die "encryption failed -- nothing was sent"
     ev="$(nak_sign_message "$sealed" "$to_hex" "$reply" "$ack")" || die "signing failed -- nothing was sent"
     # nak exiting 0 is not proof that it produced an event. It has been seen to exit
     # clean having printed nothing at all, and an unchecked empty result was ARCHIVED:
@@ -636,7 +861,14 @@ cmd_send() {
     [[ "$id" =~ ^[0-9a-f]{64}$ && "$created" =~ ^[0-9]+$ ]] || die \
         "signing printed no event -- treat it as NOT SENT and retry; nothing was archived"
     # A relay's OK is the proof of sending, and nak exits non-zero without one.
-    via="$(publish_to "$to" "$ev")" || die "no relay took it -- nothing was sent and nothing was archived"
+    local prc=0
+    via="$(publish_to "$to" "$ev")" || prc=$?
+    case "$prc" in
+        0) ;;
+        "$RC_TIMEOUT") die_rc "$prc" "NOT CONFIRMED: no relay answered within ${MAILBOX_RELAY_TIMEOUT}s -- nothing was archived. A relay that timed out may have stored it anyway, so a retry can arrive twice" ;;
+        "$RC_REFUSED") die_rc "$prc" "NOT SENT: no relay took it (refused or unreachable) -- nothing was archived" ;;
+        *)             die "NOT SENT: no relay of ours is one $to reads -- nothing was archived" ;;
+    esac
     # Only then archive, and archive the DECRYPTED copy: $ev's content is ciphertext
     # now, so writing it to .Sent would store a message its own sender cannot read.
     # Decrypting what was actually published also means a message that cannot be
@@ -683,6 +915,217 @@ cmd_delete() {
     say "unsent $id -- the relay no longer serves it; copies already fetched remain"
 }
 
+# ──────────────────────────────────────────────────────── watching ────────────
+# Still no daemon in the mailbox: the relay holds mail until it is claimed. What
+# needed one is the SESSION -- an agent mid-task does not stop to fetch, so mail
+# sat unseen, and every avatar was hand-writing fetch loops that claimed it unseen
+# too. `watch` is the one loop: it fetches, and tells the session what came in.
+#
+# `wait` is the same fetch, in the foreground, for a caller that wants to block
+# until something arrives.
+: "${MAILBOX_WATCH_INTERVAL:=30}"
+WATCH="$MAILBOX_ROOT/.watch"
+# The session cycle (harness-core) is how the watcher asks whether the session is
+# mid-turn, and how a parent's reset and limits take effect. Optional: without
+# it, the watcher still wakes the session and refuses reset and limits.
+CYCLE="${SESSION_CYCLE_BIN:-$AVATAR_ROOT/harness/core/session-cycle}"
+
+new_ids() { find "$INBOX/new" -type f -printf '%f\n' 2>/dev/null | cut -d. -f2 | sort; }
+
+fetch_quietly() { # -> rc of a fetch; its chatter goes to stderr
+    local rc=0; ( cmd_fetch ) >&2 || rc=$?; return "$rc"
+}
+
+cmd_wait() {
+    local timeout=600
+    case "${1:-}" in
+        --timeout) [[ "${2:-}" =~ ^[0-9]+$ ]] || die "usage: mailbox wait [--timeout SEC]"; timeout="$2" ;;
+        "") ;;
+        *) die "usage: mailbox wait [--timeout SEC]" ;;
+    esac
+    md_init
+    local before end id f rc got=0
+    before="$(new_ids)"; end=$(( $(date +%s) + timeout ))
+    while :; do
+        rc=0; fetch_quietly 2>/dev/null || rc=$?
+        (( rc == 0 )) || warn "fetch failed (exit $rc) -- still waiting"
+        while read -r id; do
+            [[ -n "$id" ]] || continue
+            f="$(md_find "$id")"; [[ -n "$f" ]] && { list_line "$f"; got=1; }
+        done < <(comm -13 <(printf '%s\n' "$before") <(new_ids))
+        (( got )) && return 0
+        (( $(date +%s) < end )) || { echo "  no new mail in ${timeout}s"; return "$RC_NO_MAIL"; }
+        sleep "$MAILBOX_WATCH_INTERVAL"
+    done
+}
+
+watch_log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$WATCH/log"; }
+tmuxw() { tmux ${MAILBOX_WATCH_TMUX_SOCKET:+-L "$MAILBOX_WATCH_TMUX_SOCKET"} "$@"; }
+
+# Through a paste buffer, never a command line, then Enter: the matrix-channel
+# method, so nothing in the text is interpreted.
+type_into() { # <target> <text>
+    printf '%s' "$2" | tmuxw load-buffer -b mailbox-watch - || return 1
+    tmuxw paste-buffer -d -p -b mailbox-watch -t "$1" || return 1
+    sleep 1
+    tmuxw send-keys -t "$1" Enter
+}
+
+# Typing into a session mid-turn can land in a permission prompt, where Enter
+# answers it. So the watcher types only between turns, which the session cycle's
+# hooks record. Without them (no cycle, or a harness not wired yet) it cannot
+# tell, and types anyway -- as the Matrix channel does.
+session_idle() {
+    [[ -x "$CYCLE" ]] || return 0
+    local rc=0; "$CYCLE" idle || rc=$?
+    (( rc != 1 ))
+}
+
+body_of() { sed '1,/^$/d' "$1"; }
+one_line() { tr -d '\000-\037' | cut -c1-"${1:-80}"; }
+
+# Mark an archived message with Maildir flags (sorted, as Maildir requires).
+md_flag() { # <id> <flags>
+    local f base; f="$(md_find "$1")"; [[ -n "$f" ]] || return 0
+    base="$(basename "$f")"; base="${base%%:*}"
+    [[ "$f" -ef "$INBOX/cur/$base:2,$2" ]] || mv "$f" "$INBOX/cur/$base:2,$2"
+}
+
+# Not delivered to the session: sent back with the reason, and kept in the archive
+# flagged trashed, so `list --all` shows it as refused.
+bounce() { # <id> <reason>
+    if ( cmd_reply "$1" "$2 -- not delivered. (from $MAILBOX_AVATAR's mail watcher)" ) >/dev/null 2>&1; then
+        watch_log "bounced ${1:0:8}: $2"
+    else
+        watch_log "could not bounce ${1:0:8} ($2) -- refused all the same"
+    fi
+    md_flag "$1" RST
+}
+
+# The control types: the watcher acts on them itself, without the model.
+control() { # <file> <id> <type> <from>
+    local f="$1" id="$2" out k v ceiling soft hard args=()
+    case "$3" in
+        reset)
+            [[ -x "$CYCLE" ]] || { bounce "$id" "refused: $MAILBOX_AVATAR has no session cycle to reset"; return; }
+            if out="$("$CYCLE" reset 2>&1)"; then
+                # Left unread: the fresh session finds it, and the next task it may carry.
+                watch_log "reset from $4 (${id:0:8}): $out"
+            else
+                bounce "$id" "refused: $out"
+            fi ;;
+        limits)
+            [[ -x "$CYCLE" ]] || { bounce "$id" "refused: $MAILBOX_AVATAR has no session cycle"; return; }
+            ceiling="$(team_get .limits.context_hard_max)"
+            soft="" hard=""
+            while IFS='=' read -r k v; do
+                k="${k//[[:space:]]/}"; v="${v//[[:space:]]/}"
+                [[ -z "$k" ]] && continue
+                [[ "$k" =~ ^context_(soft|hard)$ && "$v" =~ ^[0-9]+$ ]] \
+                    || { bounce "$id" "illegal: limits takes context_soft=N and context_hard=N lines, not '$k=$v'"; return; }
+                [[ "$k" == context_soft ]] && soft="$v" || hard="$v"
+                args+=("$k=$v")
+            done < <(body_of "$f")
+            (( ${#args[@]} )) || { bounce "$id" "illegal: limits named no limit"; return; }
+            [[ -z "$hard" || -z "$ceiling" ]] || (( hard <= ceiling )) \
+                || { bounce "$id" "illegal: context_hard=$hard is over the team's ceiling of $ceiling"; return; }
+            if out="$("$CYCLE" limits "${args[@]}" 2>&1)"; then
+                md_flag "$id" S; watch_log "limits from $4: ${args[*]}"
+            else
+                bounce "$id" "refused: $out"
+            fi ;;
+        status)
+            out="$([[ -x "$CYCLE" ]] && "$CYCLE" status 2>&1 || echo "no session cycle on this avatar")"
+            ( cmd_reply "$id" "$out" ) >/dev/null 2>&1 || watch_log "could not answer status from $4"
+            watch_log "status for $4" ;;
+    esac
+}
+
+# Mail this avatar sent that has no delivered receipt after MAILBOX_ACK_OVERDUE
+# seconds: the recipient has not fetched it, whatever the sender assumes. Each is
+# raised once (recorded in $WATCH/overdue), and only within a day of sending.
+# A recipient whose mailbox predates receipts never sends one, so until every
+# avatar has it, this also names those.
+: "${MAILBOX_ACK_OVERDUE:=600}"
+ack_overdue() { # -> "<id> <line>" per overdue message not yet raised
+    local f id now created to
+    now=$(date +%s)
+    while IFS= read -r f; do
+        [[ "$(hdr "$f" X-Nostr-Ack-Request)" == yes ]] || continue
+        id="$(hdr "$f" X-Nostr-Event-Id)"
+        created="$(basename "$f" | cut -d. -f1)"
+        (( now - created >= MAILBOX_ACK_OVERDUE && now - created < 86400 )) || continue
+        [[ -z "$(ack_state "$id")" ]] || continue
+        grep -qxF -- "$id" "$WATCH/overdue" 2>/dev/null && continue
+        to="$(hdr "$f" To | cut -d' ' -f1)"
+        [[ "$to" == "$MAILBOX_AVATAR" ]] && continue
+        printf '%s to %s "%s" (%s)\n' "$id" "$to" "$(hdr "$f" Subject | one_line)" "${id:0:8}"
+    done < <(find "$SENT/cur" -type f ! -name '*:2,*T*' 2>/dev/null | sort)
+}
+
+cmd_watch() {
+    local target="${1:?usage: mailbox watch <tmux-target>}"
+    md_init; mkdir -p "$WATCH"; printf '*\n' > "$WATCH/.gitignore"
+    exec 9>"$WATCH/lock"
+    flock -n 9 || die_rc "$RC_LOCKED" "another watcher already runs for $MAILBOX_AVATAR ($WATCH/lock)"
+    local handled="$WATCH/handled"
+    # Mail that was already waiting when the first watcher started is the
+    # session's, as before; the watcher answers only what arrives after it.
+    if [[ ! -f "$handled" ]]; then
+        new_ids > "$handled"
+        # Likewise, receipts owed from before the watcher are not its news.
+        find "$SENT/cur" -type f -printf '%f\n' 2>/dev/null | cut -d. -f2 > "$WATCH/overdue"
+        watch_log "first start: $(grep -c . "$handled") unread left for the session to read"
+    fi
+    watch_log "watching for $MAILBOX_AVATAR -> tmux $target, every ${MAILBOX_WATCH_INTERVAL}s"
+    local rc id f type task from why line wake=() ids=()
+    while :; do
+        rc=0; fetch_quietly 2>>"$WATCH/log" || rc=$?
+        (( rc == 0 )) || watch_log "fetch failed (exit $rc); trying again in ${MAILBOX_WATCH_INTERVAL}s"
+        wake=(); ids=()
+        while read -r id; do
+            [[ -n "$id" ]] || continue
+            f="$(md_find "$id")"; [[ -n "$f" ]] || continue
+            type="$(hdr "$f" X-Mailbox-Type)"; task="$(hdr "$f" X-Mailbox-Task)"
+            from="$(hdr "$f" From | cut -d' ' -f1)"
+            if [[ -n "$type" ]]; then
+                if why="$(illegal_in "$from" "$type" "$task")"; then
+                    bounce "$id" "illegal: $why"; echo "$id" >> "$handled"; continue
+                fi
+                case "$type" in
+                    reset|limits|status) control "$f" "$id" "$type" "$from"; echo "$id" >> "$handled"; continue ;;
+                esac
+            fi
+            line="${type:+$type }from $from \"$(hdr "$f" Subject | one_line)\" (${id:0:8})"
+            wake+=("$line"); ids+=("$id")
+        done < <(comm -23 <(new_ids) <(sort -u "$handled"))
+
+        if tmuxw has-session -t "=$target" 2>/dev/null && session_idle; then
+            local msg="" late
+            (( ${#wake[@]} )) && msg="[mailbox] ${#wake[@]} new: $(printf '%s; ' "${wake[@]}")" \
+                && msg="${msg%; }. Read each with: mailbox read <id>"
+            late="$(ack_overdue)"
+            if [[ -n "$late" ]]; then
+                [[ -n "$msg" ]] && msg="$msg -- also, "|| msg="[mailbox] "
+                msg="${msg}NOT DELIVERED after $((MAILBOX_ACK_OVERDUE / 60)) min, no receipt: $(cut -d' ' -f2- <<<"$late" | paste -sd';' | sed 's/;/; /g'). Do not assume these arrived."
+            fi
+            if [[ -n "$msg" ]]; then
+                if type_into "$target" "$msg"; then
+                    (( ${#ids[@]} )) && printf '%s\n' "${ids[@]}" >> "$handled"
+                    [[ -n "$late" ]] && cut -d' ' -f1 <<<"$late" >> "$WATCH/overdue"
+                    watch_log "woke the session: ${#wake[@]} new, $(grep -c . <<<"$late") undelivered"
+                else
+                    watch_log "could not type into tmux $target; will try again"
+                fi
+            fi
+        fi
+        # Only unread mail can be woken for, so only its ids need remembering.
+        comm -12 <(sort -u "$handled") <(new_ids) > "$handled.tmp" && mv "$handled.tmp" "$handled"
+        [[ -n "${MAILBOX_WATCH_ONCE:-}" ]] && return 0
+        sleep "$MAILBOX_WATCH_INTERVAL"
+    done
+}
+
 # When sourced (e.g. by tests) define the functions but do not dispatch.
 [[ "${BASH_SOURCE[0]}" == "${0}" ]] || return 0
 
@@ -695,6 +1138,10 @@ case "${1:-doctor}" in
     send)     shift; cmd_send "$@" ;;
     reply)    shift; cmd_reply "$@" ;;
     delete)   shift; cmd_delete "$@" ;;
-    -h|--help|help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) die "unknown command '$1' (doctor|contacts|fetch|list|read|send|reply|delete)" ;;
+    mark-read) shift; cmd_mark_read "$@" ;;
+    wait)     shift; cmd_wait "$@" ;;
+    watch)    shift; cmd_watch "$@" ;;
+    team)     shift; cmd_team "$@" ;;
+    -h|--help|help) sed -n '2,/^# WHICH RELAY/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$1' (doctor|contacts|fetch|list|read|mark-read|send|reply|delete|wait|watch|team)" ;;
 esac
