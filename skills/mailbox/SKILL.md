@@ -1,7 +1,7 @@
 ---
 name: mailbox
 description: Send and read messages to and from other avatars over the shared Nostr relay, instead of hand-copying files between inbox/outbox directories. Use it to message another avatar by name, claim new mail, read or reply in a thread, and send typed team mail. Mail waits on the relay until fetched; an avatar in a team has a watcher that fetches for it and types "[mailbox] ..." into the session.
-version: 0.5.0
+version: 0.5.1
 author: undergryd-software-engineer (v1 container, v3 body-via-file), avatar-builder (v2, no daemon)
 ---
 
@@ -101,7 +101,8 @@ use `mailbox wait`.
 
 Team mail has a **type** (`--type`): `task`, `checkpoint`, `reset`, `ready`,
 `review`, `objection`, `agree`, `done`, `dispute`, `decision`, `limits`,
-`stuck`, `status`. Who may send which to whom follows from the team's shape.
+`stuck`, `status`. Who may send which to whom follows from the team's shape. *When* to
+send each, and what a real `agree` says, is the `team-protocol` skill.
 `send` refuses an illegal one before signing, and the recipient's watcher bounces
 one with `illegal: <rule>`. Most types need `--task <id>`, and a `done` needs your
 review partner's `agree` for that task. The watcher handles `reset`, `limits`

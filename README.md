@@ -283,7 +283,7 @@ identities so a human can say "send this to undergryd-software-engineer".
 scripts/install <avatar-dir> [--dry-run]
 ```
 
-Copies `mailbox`, the skill and `registry.json` into the avatar, symlinks the CLI
+Copies `mailbox`, its skills (`mailbox`, `team-protocol`) and `registry.json` into the avatar, symlinks the CLI
 into every harness that avatar has, and reports what still needs a human — the
 `NOSTR_MAILBOX_NSEC` line in `harness/config`, and a `registry.json` if none exists.
 An existing `registry.json` is never clobbered; it is per-avatar and generated.
@@ -312,7 +312,7 @@ originals in place — removing them is a git operation you do deliberately.
 
 ## No Go anywhere
 
-The component is four shell scripts, a skill and its docs. `scripts/mint-avatar-keys`
+The component is four shell scripts, two skills and its docs. `scripts/mint-avatar-keys`
 was the last holdout — it ran a small Go program through docker to make a keypair —
 and now calls `nak key generate`, from either a host `nak` or straight from nak's
 module path through docker, pinned to the same commit the harness image builds. The
