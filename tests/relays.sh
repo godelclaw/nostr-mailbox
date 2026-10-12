@@ -81,7 +81,7 @@ is "wss://public:1" "$via" "a contact that reads only the fallback is sent there
 is "wss://public:1" "$(lines < "$work/tried")" "the default it does not read is never tried"
 
 : > "$work/tried"; DOWN="ws://local:1 wss://public:1"; rc=0; publish_to anywhere '{}' >/dev/null 2>&1 || rc=$?
-is 1 "$rc" "every relay refuses: the publish fails"
+is 4 "$rc" "every relay refuses: the publish fails, as refused (4)"
 
 : > "$work/tried"; DOWN=""; rc=0; out="$(publish_to nowhere '{}' 2>&1)" || rc=$?
 is 1 "$rc" "no relay in common: the publish fails"
@@ -99,7 +99,7 @@ is 1 "$(find "$SENT/cur" -type f | wc -l)" "and it is archived once"
 
 : > "$work/tried"; DOWN="ws://local:1 wss://public:1"; rc=0
 ( cmd_send anywhere --subject s "hello again" ) >/dev/null 2>&1 || rc=$?
-is 1 "$rc" "no relay takes it: the send fails"
+is 4 "$rc" "no relay takes it: the send fails, as refused (4)"
 is 1 "$(find "$SENT/cur" -type f | wc -l)" "and nothing more is archived"
 
 # ── reads go everywhere ──────────────────────────────────────────────────────
@@ -113,7 +113,7 @@ is '{"from":"ws://local:1"} {"from":"wss://public:1"}' "$(nak_fetch | lines)" "f
 : > "$work/read"; DOWN="ws://local:1"; rc=0; got="$(nak_fetch 2>/dev/null)" || rc=$?
 is "0 {\"from\":\"wss://public:1\"}" "$rc $got" "one relay down: the others are still read"
 : > "$work/read"; DOWN="ws://local:1 wss://public:1"; rc=0; nak_fetch >/dev/null 2>&1 || rc=$?
-is 1 "$rc" "every relay down: the fetch fails, so 'no mail' never hides 'no relay'"
+is 4 "$rc" "every relay down: the fetch fails (4), so 'no mail' never hides 'no relay'"
 
 # ── doctor names an unreachable contact ──────────────────────────────────────
 out="$(cmd_doctor 2>&1)" || true
