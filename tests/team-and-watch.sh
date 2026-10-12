@@ -207,6 +207,30 @@ is 1 "$(grep -c . "$work/published")" "status is answered without the model"
 reply_body="$(jq -r .content "$work/published" | while read -r c; do NOSTR_SECRET_KEY="$LEAD_SEC" nak_decrypt "$ME" "$c"; done | jq -r .body)"
 is "context=1234 soft=120000 hard=250000" "$reply_body" "with the session cycle's own status"
 
+# Receipts are required: every send asks, and the watcher names what has none.
+is "X-Nostr-Ack-Request: yes" "$(grep -h '^X-Nostr-Ack-Request' "$(find "$SENT/cur" -type f -newer "$work/published" | head -1)")" \
+    "every message asks for a receipt, without --ack"
+late() { # <to-hex> <age-seconds> <subject> -> id; sent mail that asked for a receipt
+    local id; id="$(hex)"; local c=$(( $(date +%s) - $2 ))
+    jq -nc --arg id "$id" --argjson c "$c" --arg a "$ME" --arg p "$1" --arg s "$3" '
+        {id: $id, created_at: $c, kind: 3838, sig: "sig", pubkey: $a, content: "x",
+         tags: [["p", $p], ["subject", $s], ["ack", "request"]]}' \
+        | render | md_deliver "$SENT" "$id" "$c" S cur >/dev/null
+    printf '%s' "$id"
+}
+lost="$(late "$PEER" 700 "lost in transit")"
+late "$PEER" 60 "just sent" >/dev/null
+got="$(late "$PEER" 700 "made it")"
+: > "$ACKS/cur/1.ackid.ack-$got-delivered.me"
+( cmd_watch pane ) 2>/dev/null; sleep 0.3
+pane_has "NOT DELIVERED after 10 min, no receipt: to peer \"lost in transit\" (${lost:0:8})" \
+    && is 1 1 "mail with no receipt after 10 minutes is raised" || is 1 0 "mail with no receipt after 10 minutes is raised"
+pane_has "just sent" && is 0 1 "fresh mail is not" || is 0 0 "fresh mail is not"
+pane_has "made it" && is 0 1 "nor mail with a receipt" || is 0 0 "nor mail with a receipt"
+before="$(tmux -L "$sock" capture-pane -p -J -t pane | grep -c 'lost in transit')"
+( cmd_watch pane ) 2>/dev/null; sleep 0.3
+is "$before" "$(tmux -L "$sock" capture-pane -p -J -t pane | grep -c 'lost in transit')" "and it is raised once"
+
 # Two watchers: the second refuses.
 exec 8>"$WATCH/lock"; flock -n 8
 rc=0; ( cmd_watch pane ) >/dev/null 2>&1 || rc=$?

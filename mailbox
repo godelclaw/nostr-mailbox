@@ -7,7 +7,7 @@
 #   mailbox list [--all]                        unread (default) or everything, one line each
 #   mailbox read <id>                           print it; marks it seen
 #   mailbox mark-read <id>... | --all           mark handled mail seen without printing it
-#   mailbox send <avatar> --subject S [--ack] [--type T [--task ID]] [--body-file F | body]
+#   mailbox send <avatar> --subject S [--type T [--task ID]] [--body-file F | body]
 #   mailbox reply <id> [--body-file F | body]   threaded reply
 #   mailbox delete <id>                         unsend mail YOU sent (NIP-09)
 #   mailbox list --all                          ... and the ack state of what you sent
@@ -799,9 +799,13 @@ cmd_read() {
 }
 
 cmd_send() {
-    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S [--ack] [--type T [--task ID]] [--body-file F | <inline body>]"
+    [[ $# -ge 1 ]] || die "usage: mailbox send <avatar> --subject S [--type T [--task ID]] [--body-file F | <inline body>]"
     local to="$1"; shift
-    local subject="" reply="" body_file="" ack="" type="" task=""
+    # Every message asks for receipts. Mail assumed delivered that was not is how
+    # work between avatars desynced on 2026-10-12; a missing receipt is the only
+    # thing a sender can notice, and the watcher says so (ack_overdue). --ack is
+    # accepted for the callers that still pass it.
+    local subject="" reply="" body_file="" ack=ack type="" task=""
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --subject|--reply|--body-file|--type|--task)
@@ -814,7 +818,7 @@ cmd_send() {
                     --task)      task="$2" ;;
                 esac
                 shift 2 ;;
-            --ack)       ack=ack; shift ;;
+            --ack)       shift ;;
             *)           break ;;
         esac
     done
@@ -1036,6 +1040,28 @@ control() { # <file> <id> <type> <from>
     esac
 }
 
+# Mail this avatar sent that has no delivered receipt after MAILBOX_ACK_OVERDUE
+# seconds: the recipient has not fetched it, whatever the sender assumes. Each is
+# raised once (recorded in $WATCH/overdue), and only within a day of sending.
+# A recipient whose mailbox predates receipts never sends one, so until every
+# avatar has it, this also names those.
+: "${MAILBOX_ACK_OVERDUE:=600}"
+ack_overdue() { # -> "<id> <line>" per overdue message not yet raised
+    local f id now created to
+    now=$(date +%s)
+    while IFS= read -r f; do
+        [[ "$(hdr "$f" X-Nostr-Ack-Request)" == yes ]] || continue
+        id="$(hdr "$f" X-Nostr-Event-Id)"
+        created="$(basename "$f" | cut -d. -f1)"
+        (( now - created >= MAILBOX_ACK_OVERDUE && now - created < 86400 )) || continue
+        [[ -z "$(ack_state "$id")" ]] || continue
+        grep -qxF -- "$id" "$WATCH/overdue" 2>/dev/null && continue
+        to="$(hdr "$f" To | cut -d' ' -f1)"
+        [[ "$to" == "$MAILBOX_AVATAR" ]] && continue
+        printf '%s to %s "%s" (%s)\n' "$id" "$to" "$(hdr "$f" Subject | one_line)" "${id:0:8}"
+    done < <(find "$SENT/cur" -type f ! -name '*:2,*T*' 2>/dev/null | sort)
+}
+
 cmd_watch() {
     local target="${1:?usage: mailbox watch <tmux-target>}"
     md_init; mkdir -p "$WATCH"; printf '*\n' > "$WATCH/.gitignore"
@@ -1046,6 +1072,8 @@ cmd_watch() {
     # session's, as before; the watcher answers only what arrives after it.
     if [[ ! -f "$handled" ]]; then
         new_ids > "$handled"
+        # Likewise, receipts owed from before the watcher are not its news.
+        find "$SENT/cur" -type f -printf '%f\n' 2>/dev/null | cut -d. -f2 > "$WATCH/overdue"
         watch_log "first start: $(grep -c . "$handled") unread left for the session to read"
     fi
     watch_log "watching for $MAILBOX_AVATAR -> tmux $target, every ${MAILBOX_WATCH_INTERVAL}s"
@@ -1071,14 +1099,23 @@ cmd_watch() {
             wake+=("$line"); ids+=("$id")
         done < <(comm -23 <(new_ids) <(sort -u "$handled"))
 
-        if (( ${#wake[@]} )) && tmuxw has-session -t "=$target" 2>/dev/null && session_idle; then
-            local msg; msg="[mailbox] ${#wake[@]} new: $(printf '%s; ' "${wake[@]}")"
-            msg="${msg%; }. Read each with: mailbox read <id>"
-            if type_into "$target" "$msg"; then
-                printf '%s\n' "${ids[@]}" >> "$handled"
-                watch_log "woke the session: ${#wake[@]} message(s)"
-            else
-                watch_log "could not type into tmux $target; will try again"
+        if tmuxw has-session -t "=$target" 2>/dev/null && session_idle; then
+            local msg="" late
+            (( ${#wake[@]} )) && msg="[mailbox] ${#wake[@]} new: $(printf '%s; ' "${wake[@]}")" \
+                && msg="${msg%; }. Read each with: mailbox read <id>"
+            late="$(ack_overdue)"
+            if [[ -n "$late" ]]; then
+                [[ -n "$msg" ]] && msg="$msg -- also, "|| msg="[mailbox] "
+                msg="${msg}NOT DELIVERED after $((MAILBOX_ACK_OVERDUE / 60)) min, no receipt: $(cut -d' ' -f2- <<<"$late" | paste -sd';' | sed 's/;/; /g'). Do not assume these arrived."
+            fi
+            if [[ -n "$msg" ]]; then
+                if type_into "$target" "$msg"; then
+                    (( ${#ids[@]} )) && printf '%s\n' "${ids[@]}" >> "$handled"
+                    [[ -n "$late" ]] && cut -d' ' -f1 <<<"$late" >> "$WATCH/overdue"
+                    watch_log "woke the session: ${#wake[@]} new, $(grep -c . <<<"$late") undelivered"
+                else
+                    watch_log "could not type into tmux $target; will try again"
+                fi
             fi
         fi
         # Only unread mail can be woken for, so only its ids need remembering.
