@@ -234,7 +234,7 @@ is "$before" "$(tmux -L "$sock" capture-pane -p -J -t pane | grep -c 'lost in tr
 # Two watchers: the second refuses.
 exec 8>"$WATCH/lock"; flock -n 8
 rc=0; ( cmd_watch pane ) >/dev/null 2>&1 || rc=$?
-is 1 "$rc" "a second watcher for the same avatar refuses to start"
+is 6 "$rc" "a second watcher for the same avatar refuses to start (6)"
 exec 8>&-
 
 if (( fails )); then printf '\n%d case(s) FAILED\n' "$fails"; exit 1; fi

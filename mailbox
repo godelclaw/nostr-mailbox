@@ -19,7 +19,7 @@
 #
 # EXIT STATUS: 0 ok; 1 refused or misused (the message says which); 3 a relay did
 # not answer in time; 4 a relay refused or could not be reached; 5 `wait` saw no
-# mail before its timeout.
+# mail before its timeout; 6 `watch` found another watcher running for this avatar.
 #
 # WHICH RELAY
 #
@@ -86,7 +86,7 @@ NIP44_MAX=65535   # NIP-44 plaintext limit, in bytes; nak does not enforce it
 # nostr-rs-relay 2026-10-12: OK returned, nothing served afterwards.
 KIND_PROBE=23838
 
-RC_TIMEOUT=3; RC_REFUSED=4; RC_NO_MAIL=5
+RC_TIMEOUT=3; RC_REFUSED=4; RC_NO_MAIL=5; RC_LOCKED=6
 
 : "${AVATAR_ROOT:=/project}"
 
@@ -403,7 +403,8 @@ illegal_in() { # <from> <type> <task>
 }
 
 cmd_team() {
-    team_has || { echo "no team ($MAILBOX_TEAM)"; return 0; }
+    # `team parent` is for scripts: no team and no parent both print nothing.
+    team_has || { [[ "${1:-}" == parent ]] || echo "no team ($MAILBOX_TEAM)"; return 0; }
     case "${1:-}" in
         parent) team_get .parent ;;
         "")     jq . "$MAILBOX_TEAM" ;;
@@ -1066,7 +1067,7 @@ cmd_watch() {
     local target="${1:?usage: mailbox watch <tmux-target>}"
     md_init; mkdir -p "$WATCH"; printf '*\n' > "$WATCH/.gitignore"
     exec 9>"$WATCH/lock"
-    flock -n 9 || die "another watcher already runs for $MAILBOX_AVATAR ($WATCH/lock)"
+    flock -n 9 || die_rc "$RC_LOCKED" "another watcher already runs for $MAILBOX_AVATAR ($WATCH/lock)"
     local handled="$WATCH/handled"
     # Mail that was already waiting when the first watcher started is the
     # session's, as before; the watcher answers only what arrives after it.

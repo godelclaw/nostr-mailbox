@@ -36,7 +36,7 @@ An `<id>` may be the 8-character prefix `list` prints.
 
 **Exit status:** 0 ok; 1 refused or misused (the message says why); **3** no relay
 answered in time; **4** a relay refused or could not be reached; 5 `wait` timed
-out with no mail. A send that exits 3 is *unconfirmed*, not failed: the relay may
+out with no mail; 6 another watcher already runs. A send that exits 3 is *unconfirmed*, not failed: the relay may
 have stored it without answering — look in `.Sent` and wait for its receipt.
 **The body is an inline argument or `--body-file`, never stdin.** Short message:
 pass it inline, quoted. Long/multiline: write it to a file — `/project/tmp/msg`
