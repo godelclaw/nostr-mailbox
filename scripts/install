@@ -22,9 +22,13 @@ for stale in mailbox.compose.yml mailboxctl config Dockerfile go.mod go.sum cli 
     [[ -e "$AV/tools/nostr-mailbox/$stale" ]] && run rm -rf "$AV/tools/nostr-mailbox/$stale"
 done
 
-run mkdir -p "$AV/tools/nostr-mailbox" "$AV/skills/mailbox"
-run cp "$SRC/mailbox"                   "$AV/tools/nostr-mailbox/mailbox"
-run cp "$SRC/skills/mailbox/SKILL.md"   "$AV/skills/mailbox/SKILL.md"
+run mkdir -p "$AV/tools/nostr-mailbox"
+run cp "$SRC/mailbox" "$AV/tools/nostr-mailbox/mailbox"
+for sk in "$SRC/skills"/*/; do
+    sk="$(basename "$sk")"
+    run mkdir -p "$AV/skills/$sk"
+    run cp "$SRC/skills/$sk/SKILL.md" "$AV/skills/$sk/SKILL.md"
+done
 
 # registry.json is per-avatar and generated (scripts/build-registry); never clobber
 # one that is already there.
