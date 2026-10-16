@@ -1,7 +1,7 @@
 ---
 name: team-protocol
 description: How to play your part in a team of avatars -- doer, reviewer or parent -- over typed mail. Use it when `mailbox team` shows you a team, when a "[mailbox]" line names typed mail (task, review, objection, agree, done, dispute, decision, stuck), and after a reset. The mailbox skill has the commands; this one is the judgment the watcher cannot check.
-version: 0.1.0
+version: 0.1.1
 author: avatar-builder
 ---
 
@@ -18,6 +18,10 @@ Typed mail moves work from one state to the next. Use untyped mail for anything
 else, such as a question or a pointer. In a team, a typed reply that the protocol
 calls for is not ceremony: your partner or parent is waiting on it.
 
+**`status` is a question, not a report.** The recipient's watcher answers it
+with its own context numbers, and its session never sees the mail. To report
+where you are, send untyped mail, or the type the protocol calls for.
+
 ## Task ids
 
 The parent mints a task id when it sends the `task`: short and unique within the
@@ -32,6 +36,9 @@ is a new task with a new id, not a reuse of the old one.
   untyped mail before starting. Do not guess at the finish line.
 - **Work in chunks.** At a clean boundary, checkpoint the way your session cycle
   says. The checkpoint mail to your parent is sent for you.
+- **Commit memory as `memory/<file>`.** If your harness reaches the memory
+  directory through a symlink (Claude's `.claude/projects/…/memory` does), git
+  refuses that path: `beyond a symbolic link`.
 - **After a reset, send `ready`** with one line: what you are about to do. The
   reset may name which task to pick up. New work only ever arrives as its own
   `task`.
