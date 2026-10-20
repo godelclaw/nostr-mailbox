@@ -839,6 +839,12 @@ cmd_send() {
     elif [[ $# -gt 0 ]]; then
         [[ $# -eq 1 ]] || die "inline body must be a single quoted argument (or use --body-file F)"
         body="$1"
+        # An inline body that names an existing local path is almost always a file
+        # meant for --body-file. Sent literally it reaches the recipient as a path
+        # into the SENDER'S container -- undeliverable content under a "sent" line
+        # that says it worked (seen in the field 2026-10-20). A genuine body that
+        # merely mentions a path is a sentence, not a bare path, and still passes.
+        [[ -e "$body" ]] && die "refusing to send: the inline body is a path that exists here -- to send the file's contents use --body-file, to send the path itself as text put it in a sentence"
     else
         die "no body -- pass an inline body or --body-file F (for a long body: mkdir -p /project/tmp first -- nothing creates it, and it is gitignored)"
     fi
