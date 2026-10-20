@@ -67,9 +67,13 @@ refuses "empty or only whitespace"      -- send recipient --subject s ""
 refuses "empty or only whitespace"      -- send recipient --subject s "   "
 refuses "not both"                      -- send recipient --subject s --body-file "$work/good" "also inline"
 refuses "single quoted argument"        -- send recipient --subject s one two three
+refuses "a path that exists here"       -- send recipient --subject s "$work/good"
+refuses "a path that exists here"       -- send recipient --subject s "$work"
 
 accepts "inline body"                   -- send recipient --subject s "a one-line message"
 accepts "--body-file"                   -- send recipient --subject s --body-file "$work/good"
+accepts "body mentioning a real path"   -- send recipient --subject s "the report is at $work/good"
+accepts "body shaped like a path that does not exist" -- send recipient --subject s "/no/such/path"
 
 if (( fails )); then printf '\n%d case(s) FAILED\n' "$fails"; exit 1; fi
 printf '\nall body-guard cases passed\n'
