@@ -1074,7 +1074,8 @@ cmd_watch() {
     md_init; mkdir -p "$WATCH"; printf '*\n' > "$WATCH/.gitignore"
     exec 9>"$WATCH/lock"
     flock -n 9 || die_rc "$RC_LOCKED" "another watcher already runs for $MAILBOX_AVATAR ($WATCH/lock)"
-    local handled="$WATCH/handled"
+    local handled="$WATCH/handled" held="$WATCH/held"
+    touch "$held"
     # Mail that was already waiting when the first watcher started is the
     # session's, as before; the watcher answers only what arrives after it.
     if [[ ! -f "$handled" ]]; then
@@ -1106,7 +1107,19 @@ cmd_watch() {
             wake+=("$line"); ids+=("$id")
         done < <(comm -23 <(new_ids) <(sort -u "$handled"))
 
-        if tmuxw has-session -t "=$target" 2>/dev/null && session_idle; then
+        local not_now=""
+        tmuxw has-session -t "=$target" 2>/dev/null || not_now="no tmux session $target"
+        [[ -n "$not_now" ]] || session_idle || not_now="session busy"
+        if [[ -n "$not_now" ]]; then
+            # Held for a later pass. Logged once per message, so held and broken
+            # do not look the same in the log.
+            local fresh
+            fresh="$(comm -23 <(printf '%s\n' "${ids[@]}" | sed '/^$/d' | sort) <(sort -u "$held"))"
+            if [[ -n "$fresh" ]]; then
+                printf '%s\n' "$fresh" >> "$held"
+                watch_log "held $(grep -c . <<<"$fresh") new: $not_now"
+            fi
+        else
             local msg="" late
             (( ${#wake[@]} )) && msg="[mailbox] ${#wake[@]} new: $(printf '%s; ' "${wake[@]}")" \
                 && msg="${msg%; }. Read each with: mailbox read <id>"
@@ -1125,7 +1138,12 @@ cmd_watch() {
                 fi
             fi
         fi
+        # Held mail that left the inbox untyped: the session read it on its own.
+        local read_first
+        read_first="$(comm -23 <(sort -u "$held") <(new_ids) | comm -23 - <(sort -u "$handled"))"
+        [[ -z "$read_first" ]] || watch_log "the session read $(grep -c . <<<"$read_first") held message(s) itself; nothing to type"
         # Only unread mail can be woken for, so only its ids need remembering.
+        comm -12 <(sort -u "$held") <(new_ids) | comm -23 - <(sort -u "$handled") > "$held.tmp" && mv "$held.tmp" "$held"
         comm -12 <(sort -u "$handled") <(new_ids) > "$handled.tmp" && mv "$handled.tmp" "$handled"
         [[ -n "${MAILBOX_WATCH_ONCE:-}" ]] && return 0
         sleep "$MAILBOX_WATCH_INTERVAL"

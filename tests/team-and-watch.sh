@@ -164,6 +164,9 @@ echo 1 > "$work/idle"
 p1="$(arrive "$PEER" "" "" "hello there" "x")"
 ( cmd_watch pane ) 2>/dev/null
 pane_has "hello there" && is 0 1 "nothing is typed while the session is busy" || is 0 0 "nothing is typed while the session is busy"
+is 1 "$(grep -c 'held 1 new: session busy' "$WATCH/log")" "holding it is logged"
+( cmd_watch pane ) 2>/dev/null
+is 1 "$(grep -c 'held 1 new: session busy' "$WATCH/log")" "once, not on every pass"
 echo 0 > "$work/idle"
 ( cmd_watch pane ) 2>/dev/null; sleep 0.3
 pane_has "[mailbox] 1 new: from peer \"hello there\" (${p1:0:8})" && is 1 1 "between turns, the session is woken with one line" || is 1 0 "between turns, the session is woken with one line"
@@ -171,6 +174,17 @@ seen_once="$(tmux -L "$sock" capture-pane -p -J -t pane | grep -c 'hello there')
 ( cmd_watch pane ) 2>/dev/null; sleep 0.3
 is "$seen_once" "$(tmux -L "$sock" capture-pane -p -J -t pane | grep -c 'hello there')" "and only once"
 is 1 "$(yes_ test -n "$(find "$INBOX/new" -name "*$p1*")")" "woken mail stays unread until the session reads it"
+is 0 "$(grep -c 'read .* held message' "$WATCH/log")" "typed mail is not reported as read by the session itself"
+
+# Held during a turn, then read by the session before the watcher could type it.
+echo 1 > "$work/idle"
+p2="$(arrive "$PEER" "" "" "read it myself" "x")"
+( cmd_watch pane ) 2>/dev/null
+( cmd_mark_read --all ) >/dev/null
+echo 0 > "$work/idle"
+( cmd_watch pane ) 2>/dev/null; sleep 0.3
+pane_has "read it myself" && is 0 1 "mail the session already read is not typed" || is 0 0 "mail the session already read is not typed"
+is 1 "$(grep -c 'the session read 1 held message(s) itself' "$WATCH/log")" "and the log says the session read it"
 
 # An illegal typed message: bounced, flagged, never typed.
 : > "$work/published"
