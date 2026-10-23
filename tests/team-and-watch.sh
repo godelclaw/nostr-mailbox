@@ -14,7 +14,8 @@ mailbox="$here/../mailbox"
 
 work="$(mktemp -d)"
 sock="mbtest$$"
-cleanup() { tmux -L "$sock" kill-session -t pane 2>/dev/null || true; rm -rf "$work"; }
+typing=""
+cleanup() { tmux -L "$sock" kill-session -t pane 2>/dev/null || true; rm -rf "$work" ${typing:+"$typing"}; }
 trap cleanup EXIT
 
 key() { local s; s="$(nak key generate)"; printf '%s %s' "$s" "$(printf %s "$s" | nak key public)"; }
@@ -244,6 +245,17 @@ pane_has "made it" && is 0 1 "nor mail with a receipt" || is 0 0 "nor mail with 
 before="$(tmux -L "$sock" capture-pane -p -J -t pane | grep -c 'lost in transit')"
 ( cmd_watch pane ) 2>/dev/null; sleep 0.3
 is "$before" "$(tmux -L "$sock" capture-pane -p -J -t pane | grep -c 'lost in transit')" "and it is raised once"
+
+# Another typer (session cycle, matrix channel) holds the shared typing lock:
+# the watcher waits for it rather than paste into the middle of its input.
+typing="$(tmux -L "$sock" display -p -t pane '#{socket_path}').typing"
+( exec 9>>"$typing"; flock 9; sleep 4 ) & holder=$!
+sleep 0.3
+type_into pane "waited its turn" & typer=$!
+sleep 2.5
+pane_has "waited its turn" && is 0 1 "nothing is typed while another typer holds the lock" || is 0 0 "nothing is typed while another typer holds the lock"
+wait "$holder" "$typer"; sleep 0.3
+pane_has "waited its turn" && is 1 1 "and it is typed once the lock is free" || is 1 0 "and it is typed once the lock is free"
 
 # Two watchers: the second refuses.
 exec 8>"$WATCH/lock"; flock -n 8

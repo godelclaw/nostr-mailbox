@@ -969,12 +969,19 @@ watch_log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >> "$WATCH/log"; }
 tmuxw() { tmux ${MAILBOX_WATCH_TMUX_SOCKET:+-L "$MAILBOX_WATCH_TMUX_SOCKET"} "$@"; }
 
 # Through a paste buffer, never a command line, then Enter: the matrix-channel
-# method, so nothing in the text is interpreted.
+# method, so nothing in the text is interpreted. Every typer (this, the session
+# cycle, the matrix channel) holds "<tmux socket>.typing" from paste to Enter,
+# so two pastes are never joined into one input. Best effort: after 10 s it
+# types anyway rather than block on a holder that hung.
 type_into() { # <target> <text>
-    printf '%s' "$2" | tmuxw load-buffer -b mailbox-watch - || return 1
-    tmuxw paste-buffer -d -p -b mailbox-watch -t "$1" || return 1
-    sleep 1
-    tmuxw send-keys -t "$1" Enter
+    local lock; lock="$(tmuxw display -p -t "$1" '#{socket_path}' 2>/dev/null)" || return 1
+    (
+        flock -w 10 9 || true
+        printf '%s' "$2" | tmuxw load-buffer -b mailbox-watch - || exit 1
+        tmuxw paste-buffer -d -p -b mailbox-watch -t "$1" || exit 1
+        sleep 1
+        tmuxw send-keys -t "$1" Enter
+    ) 9>>"$lock.typing"
 }
 
 # Typing into a session mid-turn can land in a permission prompt, where Enter
