@@ -14,6 +14,18 @@ DRY=0; [[ "${2:-}" == "--dry-run" ]] && DRY=1
 
 run() { (( DRY )) && { echo "  $*"; return; }; "$@"; }
 
+# Replace a file by rename, never by overwriting it in place. A running watcher
+# is a bash process reading `mailbox` as it goes: `cp` onto the same inode hands
+# it half-old, half-new bytes. A temp file beside the target (same filesystem,
+# so the mv is a rename) gives the new copy a new inode; the old one lives on
+# for whoever still has it open. The temp name must not exist yet: cp onto an
+# existing file keeps that file's mode, and mktemp's is 0600.
+put() { # <src> <dst>
+    local tmp="$2.install.$$"
+    run cp "$1" "$tmp"
+    run mv -f "$tmp" "$2"
+}
+
 # The v1 container's files. An avatar that still has them would otherwise keep a
 # compose file a harness folds into the agent's own stack -- the boot blocker this
 # component was rebuilt to remove.
@@ -23,11 +35,11 @@ for stale in mailbox.compose.yml mailboxctl config Dockerfile go.mod go.sum cli 
 done
 
 run mkdir -p "$AV/tools/nostr-mailbox"
-run cp "$SRC/mailbox" "$AV/tools/nostr-mailbox/mailbox"
+put "$SRC/mailbox" "$AV/tools/nostr-mailbox/mailbox"
 for sk in "$SRC/skills"/*/; do
     sk="$(basename "$sk")"
     run mkdir -p "$AV/skills/$sk"
-    run cp "$SRC/skills/$sk/SKILL.md" "$AV/skills/$sk/SKILL.md"
+    put "$SRC/skills/$sk/SKILL.md" "$AV/skills/$sk/SKILL.md"
 done
 
 # registry.json is per-avatar and generated (scripts/build-registry); never clobber
@@ -35,7 +47,7 @@ done
 if [[ -f "$AV/tools/nostr-mailbox/registry.json" ]]; then
     echo "  registry.json present, left alone"
 elif [[ -f "$SRC/registry.json" ]]; then
-    run cp "$SRC/registry.json" "$AV/tools/nostr-mailbox/registry.json"
+    put "$SRC/registry.json" "$AV/tools/nostr-mailbox/registry.json"
 else
     echo "  NOTE: no registry.json -- generate one: scripts/build-registry <avatar...> > $AV/tools/nostr-mailbox/registry.json"
 fi
