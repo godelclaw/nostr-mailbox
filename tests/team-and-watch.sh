@@ -257,6 +257,19 @@ pane_has "waited its turn" && is 0 1 "nothing is typed while another typer holds
 wait "$holder" "$typer"; sleep 0.3
 pane_has "waited its turn" && is 1 1 "and it is typed once the lock is free" || is 1 0 "and it is typed once the lock is free"
 
+# A fetch's chatter reaches the log only when the fetch failed.
+cmd_fetch() { echo "connecting... all fine" >&2; }
+( cmd_watch pane ) 2>/dev/null
+is 0 "$(grep -c 'all fine' "$WATCH/log")" "a good fetch leaves no chatter in the log"
+cmd_fetch() { echo "connecting... refused" >&2; return 4; }
+( cmd_watch pane ) 2>/dev/null
+is 1 "$(grep -c 'connecting... refused' "$WATCH/log")" "a failed fetch's output is logged"
+is 1 "$(grep -c 'fetch failed (exit 4)' "$WATCH/log")" "with its exit code"
+cmd_fetch() { echo "  REJECTED deadbeef: signature does not verify" >&2; }
+( cmd_watch pane ) 2>/dev/null
+is 1 "$(grep -c 'REJECTED deadbeef' "$WATCH/log")" "a good fetch that rejected an event is logged"
+cmd_fetch() { :; }
+
 # Two watchers: the second refuses.
 exec 8>"$WATCH/lock"; flock -n 8
 rc=0; ( cmd_watch pane ) >/dev/null 2>&1 || rc=$?

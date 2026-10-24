@@ -1092,9 +1092,15 @@ cmd_watch() {
         watch_log "first start: $(grep -c . "$handled") unread left for the session to read"
     fi
     watch_log "watching for $MAILBOX_AVATAR -> tmux $target, every ${MAILBOX_WATCH_INTERVAL}s"
-    local rc id f type task from why line wake=() ids=()
+    local rc out id f type task from why line wake=() ids=()
     while :; do
-        rc=0; fetch_quietly 2>>"$WATCH/log" || rc=$?
+        # A fetch's chatter goes to the log only when it failed or rejected an
+        # unverified event (which still exits 0): every 30 s of "connecting..."
+        # buried the events the log is read for.
+        rc=0; out="$(fetch_quietly 2>&1)" || rc=$?
+        if (( rc != 0 )) || [[ "$out" == *REJECTED* ]]; then
+            [[ -z "$out" ]] || printf '%s\n' "$out" >> "$WATCH/log"
+        fi
         (( rc == 0 )) || watch_log "fetch failed (exit $rc); trying again in ${MAILBOX_WATCH_INTERVAL}s"
         wake=(); ids=()
         while read -r id; do
