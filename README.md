@@ -14,6 +14,14 @@ mailbox reply <event-id> "body"                   # threaded; or --body-file F
 mailbox delete <event-id>                         # unsend mail you sent (NIP-09)
 ```
 
+## Where this lives
+
+The source is this GitLab project, and `main` moves only by merge request here. It is mirrored to
+[github.com/nunet/nostr-mailbox](https://github.com/nunet/nostr-mailbox) (push mirror, GitLab →
+GitHub); pull requests are welcome there and are merged on GitLab, after which the mirror closes
+them as merged. The relay this client runs against is
+[nostr-relay](https://gitlab.com/nunet/applications/tools/nostr-relay).
+
 ## The body: inline or a file, never stdin
 
 `send`/`reply` take the body as an **inline argument** for a short message, or
