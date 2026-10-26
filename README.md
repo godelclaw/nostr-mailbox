@@ -320,11 +320,16 @@ originals in place — removing them is a git operation you do deliberately.
 
 ## No Go anywhere
 
-The component is four shell scripts, two skills and its docs. `scripts/mint-avatar-keys`
+The component is five shell scripts, two skills and its docs. `scripts/mint-avatar-keys`
 was the last holdout — it ran a small Go program through docker to make a keypair —
 and now calls `nak key generate`, from either a host `nak` or straight from nak's
 module path through docker, pinned to the same commit the harness image builds. The
 minting side and the running side cannot be different code.
 
 The private key never leaves a shell variable and `pass`: not the screen, not the
-scrollback, not the shell history, and not any process's argv.
+scrollback, not the shell history, and not any process's argv. The two public
+halves are not secrets and go to plain files, `$KEYS_DIR/<avatar>/nostr-pubkey-hex`
+and `nostr-npub`, which `build-registry` and the relay's `sync-allowlist` read.
+A worker clone's key is `--throwaway`: its private half goes to the caller on
+fd 3, to be injected into the worker's container, and is stored nowhere.
+`drop-avatar-keys` takes back what `mint-avatar-keys` wrote.

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Forget an avatar's Nostr identity. MAINTAINER-run, host-side; the reverse of
+# mint-avatar-keys.
+#
+#   KEYS_DIR=<dir> scripts/drop-avatar-keys <avatar> [avatar...]
+#
+# Removes $KEYS_DIR/<avatar>/ (the public halves) and, when there is one, the
+# avatar's private key <prefix>/<avatar>/nostr-nsec -- a --throwaway worker has
+# none -- plus any public entries left in pass from before KEYS_DIR. Nothing else
+# in the avatar's pass folder is touched. It does not touch the relay: drop the
+# avatar from the allowlist too (nostr-relay `sync-allowlist --drop <avatar>`),
+# or the key keeps its access.
+set -euo pipefail
+
+PASS_PREFIX="${PASS_PREFIX:-nunet/avatars}"
+
+die() { echo "drop-avatar-keys: $*" >&2; exit 1; }
+
+[ $# -gt 0 ] || { echo "usage: KEYS_DIR=<dir> $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
+[[ -n "${KEYS_DIR:-}" ]] || die "KEYS_DIR is not set -- the directory holding <avatar>/nostr-pubkey-hex"
+for avatar in "$@"; do
+    [[ "$avatar" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "not an avatar name: '$avatar'"
+done
+
+store="${PASSWORD_STORE_DIR:-$HOME/.password-store}"
+for avatar in "$@"; do
+    gone=()
+    [[ -d "$KEYS_DIR/$avatar" ]] && { rm -rf -- "${KEYS_DIR:?}/$avatar"; gone+=(public); }
+    for entry in nostr-nsec nostr-pubkey-hex nostr-npub; do
+        [[ -f "$store/$PASS_PREFIX/$avatar/$entry.gpg" ]] || continue
+        pass rm -f "$PASS_PREFIX/$avatar/$entry" >/dev/null; gone+=("pass:$entry")
+    done
+    printf '%-34s dropped: %s\n' "$avatar" "${gone[*]:-nothing (had no keys)}"
+done

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Build the address book (registry.json) from the keys already in pass, and print
-# it on stdout. MAINTAINER-run, host-side.
+# Build the address book (registry.json) from the public keys mint-avatar-keys
+# wrote, and print it on stdout. MAINTAINER-run, host-side.
 #
-#   scripts/build-registry <avatar> [avatar...] > registry.json
+#   KEYS_DIR=<dir> scripts/build-registry <avatar> [avatar...] > registry.json
 #
 # It is a plain name -> identity map: which name goes with which key, used to
 # address an outgoing message and to name the sender of an incoming one. Not a
@@ -10,18 +10,24 @@
 # file. Each avatar gets a COPY it owns and can extend; there is no shared
 # original to mount, because avatars will not always share a filesystem.
 #
-# Needs pass on the host. Reads only the PUBLIC entries.
+# Reads only the PUBLIC halves, $KEYS_DIR/<avatar>/{nostr-npub,nostr-pubkey-hex};
+# no pass. An avatar whose halves are still in pass from before KEYS_DIR has to be
+# migrated first (`./fleet mailbox migrate-keys` in harness-core).
 set -euo pipefail
 
-PASS_PREFIX="${PASS_PREFIX:-nunet/avatars}"
+die() { echo "build-registry: $*" >&2; exit 1; }
 
-[ $# -gt 0 ] || { echo "usage: $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
+[ $# -gt 0 ] || { echo "usage: KEYS_DIR=<dir> $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
+[[ -n "${KEYS_DIR:-}" ]] || die "KEYS_DIR is not set -- the directory holding <avatar>/nostr-npub"
 
 printf '{\n'
 sep=""
 for avatar in "$@"; do
-    npub=$(pass show "$PASS_PREFIX/$avatar/nostr-npub" | head -1)
-    hex=$(pass show "$PASS_PREFIX/$avatar/nostr-pubkey-hex" | head -1)
+    npub="" hex=""
+    [[ -s "$KEYS_DIR/$avatar/nostr-npub" ]]       && npub="$(head -1 "$KEYS_DIR/$avatar/nostr-npub")"
+    [[ -s "$KEYS_DIR/$avatar/nostr-pubkey-hex" ]] && hex="$(head -1 "$KEYS_DIR/$avatar/nostr-pubkey-hex")"
+    [[ "$npub" =~ ^npub1[02-9ac-hj-np-z]+$ ]] || die "no usable $KEYS_DIR/$avatar/nostr-npub -- mint or migrate first"
+    [[ "$hex" =~ ^[0-9a-f]{64}$ ]]            || die "no usable $KEYS_DIR/$avatar/nostr-pubkey-hex -- mint or migrate first"
     printf '%s  "%s": { "npub": "%s", "pubkey_hex": "%s", "did:key": "", "dids": [], "display": "%s" }' \
         "$sep" "$avatar" "$npub" "$hex" "$avatar"
     sep=$',\n'

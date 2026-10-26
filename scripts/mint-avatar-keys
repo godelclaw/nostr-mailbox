@@ -1,30 +1,36 @@
 #!/usr/bin/env bash
-# Mint a Nostr keypair per avatar and store it in pass. MAINTAINER-run, host-side:
-# agents never mint their own identity.
+# Mint a Nostr keypair per avatar. MAINTAINER-run, host-side: agents never mint
+# their own identity.
 #
-#   scripts/mint-avatar-keys <avatar> [avatar...]
+#   KEYS_DIR=<dir> scripts/mint-avatar-keys <avatar> [avatar...]
+#   KEYS_DIR=<dir> scripts/mint-avatar-keys --throwaway <worker> 3>&1 >/dev/null
 #
-# Per avatar it writes three pass entries -- everything about that identity lives
-# in pass, nowhere else:
+# The private key goes to pass; the two PUBLIC halves go to plain files, since
+# they are not secrets and everything that publishes an avatar reads them:
 #
-#   <prefix>/<avatar>/nostr-nsec         private key, 64-char hex
-#   <prefix>/<avatar>/nostr-pubkey-hex   public key -> relay pubkey_whitelist
-#   <prefix>/<avatar>/nostr-npub         public key, bech32 -> registry.json
+#   pass   <prefix>/<avatar>/nostr-nsec         private key, 64-char hex
+#   file   $KEYS_DIR/<avatar>/nostr-pubkey-hex  public key -> relay pubkey_whitelist
+#   file   $KEYS_DIR/<avatar>/nostr-npub        public key, bech32 -> registry.json
+#
+# --throwaway is for a worker clone, whose key lives exactly as long as its
+# container: the public halves are written as above, the private key is NOT
+# stored anywhere -- it is written to fd 3 for the caller to inject, and the
+# script refuses if fd 3 is not open. One worker per call.
 #
 # The public parts are echoed, since they are what gets copied into registry.json
-# and config.toml. The private key is never printed: it lives in a shell variable
-# and goes to pass on stdin, so it reaches neither the screen, the scrollback, the
-# shell history, nor any process's argv.
+# and config.toml. The private key never reaches the screen, the scrollback, the
+# shell history, nor any process's argv: it lives in a shell variable and goes to
+# pass (or fd 3) on stdin.
 #
 # RE-RUNNING MINTS NEW KEYS and overwrites the entries. An avatar already published
 # in registry.json and the relay allowlist must be re-published, or it will fail
 # its identity check: `mailbox doctor` asserts the injected key derives the pubkey
-# the registry claims for it. `nostr-relay/scripts/fleet-keys rotate` does both.
+# the registry claims for it. `./fleet mailbox rotate` (harness-core) does both.
 #
-# Needs `pass`, and either `nak` on the host or docker. No Go toolchain either way:
-# with docker it runs nak straight from its module path, pinned to the same commit
-# the harness image builds, so the minting side and the running side cannot be
-# different code.
+# Needs `pass` (not with --throwaway), and either `nak` on the host or docker. No
+# Go toolchain either way: with docker it runs nak straight from its module path,
+# pinned to the same commit the harness image builds, so the minting side and the
+# running side cannot be different code.
 set -euo pipefail
 
 PASS_PREFIX="${PASS_PREFIX:-nunet/avatars}"
@@ -38,13 +44,24 @@ NAK_COMMIT="${NAK_COMMIT:-fb21939f45538eff414068fa1bb6f1bea705f447}"   # v0.20.6
 # the minting side and the running side on the same code, so it uses the same base.
 GO_IMAGE="${GO_IMAGE:-golang:1.25-bookworm}"
 
-[ $# -gt 0 ] || { echo "usage: $(basename "$0") <avatar> [avatar...]" >&2; exit 2; }
+die() { echo "mint-avatar-keys: $*" >&2; exit 1; }
+
+throwaway=0
+[[ "${1:-}" == --throwaway ]] && { throwaway=1; shift; }
+[ $# -gt 0 ] || { echo "usage: KEYS_DIR=<dir> $(basename "$0") [--throwaway] <avatar> [avatar...]" >&2; exit 2; }
+[[ -n "${KEYS_DIR:-}" ]] || die "KEYS_DIR is not set -- the directory the public halves go to"
+if (( throwaway )); then
+    [ $# -eq 1 ] || die "--throwaway mints one worker per call"
+    { true >&3; } 2>/dev/null || die "--throwaway writes the private key to fd 3, which is not open"
+fi
+for avatar in "$@"; do
+    [[ "$avatar" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || die "not an avatar name: '$avatar'"
+done
 
 if command -v nak >/dev/null; then
     nak_run() { nak "$@"; }
 else
-    command -v docker >/dev/null \
-        || { echo "mint-avatar-keys: needs nak or docker on the host" >&2; exit 1; }
+    command -v docker >/dev/null || die "needs nak or docker on the host"
     # -i so `key public` can still read the secret from stdin rather than argv.
     nak_run() {
         docker run --rm -i -u "$(id -u):$(id -g)" -e HOME=/tmp \
@@ -54,15 +71,21 @@ fi
 
 for avatar in "$@"; do
     sk="$(nak_run key generate)"
-    [ ${#sk} -eq 64 ] || { echo "mint-avatar-keys: nak did not return a 64-char key" >&2; exit 1; }
+    [ ${#sk} -eq 64 ] || die "nak did not return a 64-char key"
 
     pubkey_hex="$(printf %s "$sk" | nak_run key public)"
     npub="$(nak_run encode npub "$pubkey_hex")"
 
-    printf '%s\n' "$sk"         | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-nsec" >/dev/null
-    printf '%s\n' "$pubkey_hex" | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-pubkey-hex" >/dev/null
-    printf '%s\n' "$npub"       | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-npub" >/dev/null
+    if (( throwaway )); then
+        printf '%s\n' "$sk" >&3
+    else
+        printf '%s\n' "$sk" | pass insert -m -f "$PASS_PREFIX/$avatar/nostr-nsec" >/dev/null
+    fi
     unset sk
+
+    mkdir -p "$KEYS_DIR/$avatar"
+    printf '%s\n' "$pubkey_hex" > "$KEYS_DIR/$avatar/nostr-pubkey-hex"
+    printf '%s\n' "$npub"       > "$KEYS_DIR/$avatar/nostr-npub"
 
     printf '%-34s pubkey_hex=%s  npub=%s\n' "$avatar" "$pubkey_hex" "$npub"
 done
