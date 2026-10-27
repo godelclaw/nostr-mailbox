@@ -555,9 +555,10 @@ seal() { # <to-hex> <subject> <body> [<type> [<task>]]
 # event (sent by a mailbox older than this one) passes through unchanged.
 open_event() { # event JSON on stdin -> event JSON on stdout; fails if it cannot decrypt
     local ev peer pt; ev="$(cat)"
-    # A type or task only ever comes from inside the ciphertext. One in the clear
-    # tags would be an older or a forged sender's, and is dropped.
-    ev="$(jq -c '.tags |= map(select(.[0] != "type" and .[0] != "task"))' <<<"$ev")"
+    # A type or task only ever comes from inside the ciphertext, and the sender's
+    # name only from the registry's reading of the author key. Such tags in the
+    # clear would be an older or a forged sender's, and are dropped.
+    ev="$(jq -c '.tags |= map(select(.[0] != "type" and .[0] != "task" and .[0] != "from_name"))' <<<"$ev")"
     if ! jq -e '.tags[] | select(.[0]=="encrypted" and .[1]=="nip44")' <<<"$ev" >/dev/null; then
         printf '%s' "$ev"; return 0
     fi
@@ -565,7 +566,10 @@ open_event() { # event JSON on stdin -> event JSON on stdout; fails if it cannot
     [[ "$peer" == "$MY_HEX" ]] && peer="$(jq -r '(.tags[] | select(.[0]=="p") | .[1]) // ""' <<<"$ev" | head -1)"
     pt="$(nak_decrypt "$peer" "$(jq -r '.content' <<<"$ev")" 2>/dev/null)" || return 1
     jq -e 'has("subject") and has("body")' <<<"$pt" >/dev/null 2>&1 || return 1
-    jq -c --argjson pt "$pt" '.content = $pt.body | .tags += [["subject", $pt.subject]]
+    # The subject of encrypted mail is the one inside the ciphertext; a clear
+    # subject tag would shadow it in render(), and is dropped.
+    jq -c --argjson pt "$pt" '.content = $pt.body
+        | .tags |= map(select(.[0] != "subject")) | .tags += [["subject", $pt.subject]]
         | if ($pt.type | type) == "string" then .tags += [["type", $pt.type]] else . end
         | if ($pt.task | type) == "string" then .tags += [["task", $pt.task]] else . end' <<<"$ev"
 }
@@ -576,25 +580,29 @@ open_event() { # event JSON on stdin -> event JSON on stdout; fails if it cannot
 # a Nostr "e" tag IS In-Reply-To.
 render() { # event JSON on stdin -> RFC 5322 on stdout
     local ev; ev="$(cat)"
-    local id created content subject from_hex from_name reply_to to_hex to_name
+    local id created content subject from_hex from_name from_addr reply_to to_hex to_name
     id=$(jq -r '.id' <<<"$ev")
     created=$(jq -r '.created_at' <<<"$ev")
     from_hex=$(jq -r '.pubkey' <<<"$ev")
     content=$(jq -r '.content' <<<"$ev")
     subject=$(jq -r '(.tags[] | select(.[0]=="subject") | .[1]) // ""' <<<"$ev" | head -1)
-    from_name=$(jq -r '(.tags[] | select(.[0]=="from_name") | .[1]) // ""' <<<"$ev" | head -1)
     reply_to=$(jq -r '(.tags[] | select(.[0]=="e") | .[1]) // ""' <<<"$ev" | head -1)
     # The recipient is the "p" tag, not necessarily us: render() archives our own
     # outgoing mail too, and there the addressee is the other avatar.
     to_hex=$(jq -r '(.tags[] | select(.[0]=="p") | .[1]) // ""' <<<"$ev" | head -1)
     to_name="$(reg_name "$to_hex")"
     [[ -n "$to_name" ]] || to_name="$MAILBOX_AVATAR"
-    [[ -n "$from_name" ]] || from_name="$(reg_name "$from_hex")"
+    # The sender is whom the registry names for the key that signed: never a
+    # name the event itself carries, which its author could set to anyone's.
+    from_name="$(reg_name "$from_hex")"
+    from_addr=""
+    [[ -n "$from_name" ]] && from_addr="$(reg_npub "$from_name")"
     [[ -n "$from_name" ]] || from_name="unknown"
+    [[ -n "$from_addr" ]] || from_addr="$from_hex"
 
     printf 'Message-ID: <%s@nostr>\n' "$id"
     printf 'Date: %s\n' "$(date -u -R -d "@$created")"
-    printf 'From: %s <%s@nostr>\n' "$from_name" "$(reg_npub "$from_name" || echo "$from_hex")"
+    printf 'From: %s <%s@nostr>\n' "$from_name" "$from_addr"
     printf 'To: %s <%s@nostr>\n' "$to_name" "$(reg_npub "$to_name")"
     printf 'Subject: %s\n' "$subject"
     [[ -n "$reply_to" ]] && printf 'In-Reply-To: <%s@nostr>\n' "$reply_to"

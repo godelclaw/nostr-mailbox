@@ -99,6 +99,9 @@ NIP-01 event. `kind` is the payload-format version.
 - `pubkey` sender · `content` body (markdown) · `sig` schnorr · `created_at` unix s
 - tags: `["p", <recipient hex>]` — the only routing datum — `["subject", …]`,
   `["from_name", …]`, `["e", <parent>, "", "reply"]` (NIP-10) on a reply.
+  A `from_name` tag is never believed: the sender is the registry's name for
+  `pubkey` (the first entry with that key, when several have it), and the
+  subject of encrypted mail is the one inside the ciphertext.
 
 `kind 3839` (receipt) is retired. Nothing emits or consumes it.
 
